@@ -4,7 +4,7 @@ Thanks for helping. Small, focused pull requests are easiest to review.
 
 ## Ground rules
 
-- **Keep it simple.** Build what the issue needs, nothing speculative. The engine and backup runner use only the Python standard library, and the rest is Bash. Please don't add dependencies without discussing them in an issue first.
+- **Keep it simple.** Build what the issue needs, nothing speculative. The engine, the backup runner and the Python modules (shared code in `lib/softsynk`) use only the Python standard library, and the rest is Bash. Please don't add dependencies without discussing them in an issue first.
 - **No secrets in arguments.** Credentials come from prompts or `SOFTSYNK_ANSWER_<NAME>` environment variables, never command-line options.
 - **Never test against a live server.** Tests use temporary directories and stubs.
 
@@ -13,7 +13,7 @@ Thanks for helping. Small, focused pull requests are easiest to review.
 You need Python 3.11+, Bash and [ShellCheck](https://www.shellcheck.net). The backup smoke test also needs local PostgreSQL server and client binaries and [restic](https://restic.net), and the UI tests use [gum](https://github.com/charmbracelet/gum) when it is installed. macOS and Linux both work.
 
 ```bash
-for d in tests/engine tests/backup tests/deployment; do python3 -m unittest discover -s "$d" || break; done
+for d in tests/lib tests/notify tests/housekeeping tests/optimizer tests/monitor tests/hardening tests/engine tests/backup tests/deployment; do python3 -m unittest discover -s "$d" || break; done
 bash tests/ui/test_ui.sh
 bash deployment/redis-setup/setup-redis.sh --self-test
 bash deployment/auto-updates/setup-auto-updates.sh --self-test

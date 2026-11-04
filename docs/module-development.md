@@ -1,4 +1,4 @@
-# Writing a softsynk-server module
+# Writing a Synk Server Manager module
 
 A module is a folder with a manifest and the scripts the manifest points to. The engine never imports module code; it only validates the manifest and runs the declared commands. Read [architecture.md](architecture.md) first for the overall picture.
 

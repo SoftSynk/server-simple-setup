@@ -1,0 +1,28 @@
+schema = 1
+id = "hardening"
+name = "SSH and firewall hardening"
+description = "Finds weak SSH and firewall settings, explains benefit and risk, and applies the ones you pick with a revert timer so you cannot lock yourself out"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "synk-harden apply writes /etc/ssh/sshd_config.d/10-softsynk.conf (SSH password, root login and session limits) and reloads ssh.service after sshd -t accepts it and sshd -T shows the new values",
+  "synk-harden apply turns on ufw only when chosen: it allows every SSH port first, denies other incoming ports, and keeps 80/443 open when a web server listens",
+  "turning passwords off is refused unless the login log proves this session logged in with a key",
+  "before any change a transient systemd timer is armed that restores the old SSH and ufw files after 10 minutes (revert_minutes); synk-harden confirm, run from a NEW SSH session, cancels it",
+  "backs up the files it changes under the management root before writing, and stores its pending-change record and logs there",
+  "links /usr/local/bin/synk-harden when it is missing",
+]
+
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install   = ["synk-harden", "audit"]
+configure = ["synk-harden", "audit"]
+status    = ["synk-harden", "--status-json"]
+
+[commands]
+synk-harden = "synk-harden"

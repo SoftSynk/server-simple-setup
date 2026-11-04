@@ -1,6 +1,6 @@
 # setup-redis.sh
 
-An interactive, idempotent script that installs and configures Redis on Ubuntu and Debian servers that use systemd. It is the `redis` module of softsynk-server: `softsynk-server install redis` runs it, and `softsynk-server --status` reads its `--status-json`.
+An interactive, idempotent script that installs and configures Redis on Ubuntu and Debian servers that use systemd. It is the `redis` module of Synk Server Manager: `softsynk-server install redis` runs it, and `softsynk-server --status` reads its `--status-json`.
 
 On the first run it installs Redis (after asking) and sets up either one shared instance or two instances: one for cache and one for queues. On later runs it shows the current state and offers only the actions that still apply. Before each change it shows a plan and asks for approval. It backs up the files, checks the new config, applies the change while Redis keeps running where possible, and then confirms the result.
 
@@ -110,7 +110,7 @@ sudo ./deployment/redis-setup/setup-redis.sh
 | `--self-test` | Checks the script's internal helpers (size parsing, config block handling). Needs no root and no Redis, and runs on macOS too |
 | `--help` | Shows the usage text |
 
-An unknown option exits 64. The same switches can come from the environment (`SOFTSYNK_NONINTERACTIVE=1`, `SOFTSYNK_ACCEPT_DEFAULTS=1`, `SOFTSYNK_DRY_RUN=1`, `SOFTSYNK_ROOT`), which is how softsynk-server passes them.
+An unknown option exits 64. The same switches can come from the environment (`SOFTSYNK_NONINTERACTIVE=1`, `SOFTSYNK_ACCEPT_DEFAULTS=1`, `SOFTSYNK_DRY_RUN=1`, `SOFTSYNK_ROOT`), which is how Synk Server Manager passes them.
 
 Run it with `--dry-run` first on any server that already has data.
 
@@ -360,7 +360,7 @@ The RAM table above uses nominal sizes. A "8 GB" server reports a little less RA
 
 ## Module status (`--status-json`)
 
-`./setup-redis.sh --status-json` prints one JSON line in the softsynk-server status format (schema 1) and exits 0 whatever it finds. It takes no lock, writes no log or temporary file, never installs anything and never prompts. For each instance it reads the config file and the unit state, then sends only `PING`, `INFO` and `CONFIG GET` to `127.0.0.1`. The password goes to `redis-cli` through `REDISCLI_AUTH` and is never printed; the output says only whether one is set.
+`./setup-redis.sh --status-json` prints one JSON line in the Synk Server Manager status format (schema 1) and exits 0 whatever it finds. It takes no lock, writes no log or temporary file, never installs anything and never prompts. For each instance it reads the config file and the unit state, then sends only `PING`, `INFO` and `CONFIG GET` to `127.0.0.1`. The password goes to `redis-cli` through `REDISCLI_AUTH` and is never printed; the output says only whether one is set.
 
 Root sees the most: the configs (mode 640, `root:redis`) hold each instance's port, role and password. Without root, an unreadable config makes the health `unknown` with the message `cannot read ... (run as root)`, never a crash.
 
@@ -426,7 +426,7 @@ Backups are never deleted automatically. Remove old ones yourself when you no lo
 
 The script has no server-specific values. Everything comes from discovery: RAM, CPU, Redis version and existing instances. To use it on another server:
 
-1. Install softsynk-server on the server (or copy the repository layout: `deployment/redis-setup/` and `lib/`).
+1. Install Synk Server Manager on the server (or copy the repository layout: `deployment/redis-setup/` and `lib/`).
 2. Run it with `--dry-run` and read the plans.
 3. Run it for real.
 
@@ -446,7 +446,7 @@ To change the defaults for a team, edit the constants at the top of `setup-redis
 - Redis 6.0 is the oldest supported version. On Redis 6, changing `bind` needs a restart.
 - The package's logrotate rule may not cover log files with other names that you created by hand (for example `redis-cache.log`).
 
-**What was tested:** `bash -n` (syntax), ShellCheck 0.11 with no warnings, and `--self-test` (size parsing, rounding of recommendations, config-block replace and reload, local-bind detection), all on macOS with Bash 3.2 and `/bin/bash`. `tests/deployment/test_status.py` also runs `--status-json` against stubbed `systemctl`, `redis-cli` and friends (healthy, stopped, failed save, memory, open bind, unreadable config, adopted, not installed, no password in the output) and checks that softsynk-server accepts the output.
+**What was tested:** `bash -n` (syntax), ShellCheck 0.11 with no warnings, and `--self-test` (size parsing, rounding of recommendations, config-block replace and reload, local-bind detection), all on macOS with Bash 3.2 and `/bin/bash`. `tests/deployment/test_status.py` also runs `--status-json` against stubbed `systemctl`, `redis-cli` and friends (healthy, stopped, failed save, memory, open bind, unreadable config, adopted, not installed, no password in the output) and checks that Synk Server Manager accepts the output.
 
 **What still needs a real Ubuntu or Debian server.** It was deliberately not run against a live Redis or systemd. Before relying on it, check these on a disposable VM:
 

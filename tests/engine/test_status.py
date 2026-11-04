@@ -120,11 +120,11 @@ class StatusText(Base):
 
 class ReadOnly(Base):
     def test_read_only_commands_write_nothing(self):
-        rel = self.release(["alpha", "beta", "ubuntuonly", "bad-shell-string"])
+        rel = self.release(["alpha", "beta", "ubuntuonly", "bad-shell-string", "cmds"])
         self.root.mkdir()
         mark_installed(self.root, "alpha")
         before = (support.tree_hash(self.root), support.tree_hash(rel))
-        for args in (["--status"], ["--status", "--json"], ["--list"], ["validate"], ["--version"], ["--help"]):
+        for args in (["--status"], ["--status", "--json"], ["--list"], ["validate"], ["commands"], ["--version"], ["--help"]):
             with self.subTest(args=args):
                 engine(rel, args, self.root)
                 self.assertEqual((support.tree_hash(self.root), support.tree_hash(rel)), before)
@@ -133,7 +133,15 @@ class ReadOnly(Base):
         rel = self.release(["alpha"])
         engine(rel, ["--status"], self.root)
         engine(rel, ["--list"], self.root)
+        engine(rel, ["commands"], self.root)
         self.assertFalse(self.root.exists())
+
+    def test_commands_lists_valid_manifest_commands_as_name_tab_path(self):
+        rel = self.release(["alpha", "cmds", "bad-shell-string"])
+        r = engine(rel, ["commands"], self.root)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [f"synk-one\t{rel}/deployment/cmds/one",
+                                                 f"synk-two\t{rel}/deployment/cmds/sub/two"])
 
 
 if __name__ == "__main__":

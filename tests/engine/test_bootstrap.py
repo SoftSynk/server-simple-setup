@@ -61,14 +61,14 @@ class Bootstrap(BootstrapBase):
         self.assertEqual(tree_hash(self.root / "releases"), before)
         self.assertIsNone(self.link("previous"))
 
-    def test_synk_backup_link_only_when_the_module_ships_it(self):
+    def test_manifest_commands_are_linked_once_a_release_ships_them(self):
         self.boot()
-        self.assertFalse((self.bin / "synk-backup").exists() or (self.bin / "synk-backup").is_symlink())
-        v2 = self.release(["alpha"], name="v2", version="0.2.0")
-        (v2 / "deployment" / "backup").mkdir()
-        (v2 / "deployment" / "backup" / "synk-backup").write_text("#!/bin/sh\n")
+        self.assertEqual(sorted(p.name for p in self.bin.iterdir()), ["softsynk-server"])
+        v2 = self.release(["alpha", "cmds"], name="v2", version="0.2.0")
         self.assertEqual(self.boot(v2).returncode, 0)
-        self.assertEqual(os.readlink(self.bin / "synk-backup"), str(self.root / "current/deployment/backup/synk-backup"))
+        cur = self.root / "current"
+        self.assertEqual(os.readlink(self.bin / "synk-one"), str(cur / "deployment/cmds/one"))
+        self.assertEqual(os.readlink(self.bin / "synk-two"), str(cur / "deployment/cmds/sub/two"))
 
     def test_foreign_command_link_is_left_alone(self):
         self.bin.mkdir()
@@ -77,6 +77,15 @@ class Bootstrap(BootstrapBase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("points elsewhere", r.stderr)
         self.assertEqual(os.readlink(self.bin / "softsynk-server"), "/bin/echo")
+
+    def test_foreign_manifest_command_link_is_left_alone(self):
+        self.bin.mkdir()
+        (self.bin / "synk-one").symlink_to("/bin/echo")
+        r = self.boot(self.release(["alpha", "cmds"], name="v2", version="0.2.0"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("synk-one points elsewhere", r.stderr)
+        self.assertEqual(os.readlink(self.bin / "synk-one"), "/bin/echo")
+        self.assertTrue((self.bin / "synk-two").is_symlink())  # the other command is still linked
 
     def test_usage_errors_exit_64(self):
         for args in (["--root", "relative/path"], ["--sha256", "abc"], ["--from", str(self.tmp / "nope")],

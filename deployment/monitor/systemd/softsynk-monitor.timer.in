@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the softsynk health check every @INTERVAL@ seconds
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=@INTERVAL@s
+AccuracySec=5s
+Unit=softsynk-monitor.service
+
+[Install]
+WantedBy=timers.target

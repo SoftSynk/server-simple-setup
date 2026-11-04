@@ -81,9 +81,10 @@ The wizard asks for:
    - `custom`: you give the endpoint; region defaults to `us-east-1`
 3. Bucket, optional prefix, and the S3 access key id and secret.
 4. The restic repository password: generate one or type your own (at least 12 characters).
-5. An optional e-mail address for failure notices (needs a working `sendmail` on the server; the module does not
-   install a mail system).
-6. Retention counts and databases to exclude.
+5. Retention counts and databases to exclude.
+
+Failure mail is not set up here: run `synk-notify configure` once (the `notify` module) and every failed backup is
+mailed through it.
 
 Nothing is written or enabled until all answers validate: the tools, PostgreSQL access, the bucket and both
 repositories are checked first. `--dry-run` runs only those checks.
@@ -108,8 +109,7 @@ because options show up in `ps`:
 sudo env SOFTSYNK_ANSWER_REPO_PASSWORD='...' SOFTSYNK_ANSWER_S3_ACCESS_KEY_ID='...' \
   SOFTSYNK_ANSWER_S3_SECRET_ACCESS_KEY='...' \
   deployment/backup/setup-backup.sh --non-interactive \
-  --remote-preset r2 --remote-id ACCOUNT_ID --remote-bucket my-bucket \
-  --mail-to ops@example.com
+  --remote-preset r2 --remote-id ACCOUNT_ID --remote-bucket my-bucket
 ```
 
 `--s3-access-key-id`, `--repo-password` and `--s3-secret-access-key` are rejected with exit 64. The remote
@@ -127,7 +127,7 @@ repository URL (`remote.repo`, for a `rest:` or `sftp:` remote) must not contain
 ```sh
 synk-backup --status               # health: 0 healthy, 1 degraded, 2 unhealthy, 3 unknown/stale/not installed
 synk-backup --status --json        # same document as JSON, same exit codes
-synk-backup --status-json          # same JSON, but always exits 0 (what softsynk-server reads)
+synk-backup --status-json          # same JSON, but always exits 0 (what Synk Server Manager reads)
 synk-backup snapshots              # local repository; --from remote for the bucket; --json
 synk-backup run                    # back up what is due now (the timer does this)
 synk-backup run --db NAME          # one database only (skips globals, check and restore test)
@@ -158,7 +158,10 @@ run are cleared before each run.
 Exit codes of `run`: 0 all done, 1 failed, 2 partial (some databases failed; the others are saved). 64 means a
 usage or configuration error, 130 cancelled.
 
-When a unit fails, `softsynk-notify@.service` mails the status to the configured address.
+`softsynk-backup.service` has `OnFailure=softsynk-alert@%n.service`: when it fails, the notify module mails the
+status to the recipients set with `synk-notify configure`. Without that unit nothing is mailed; `setup-backup.sh`
+warns when `softsynk-alert@.service` is missing. `mail_to` and `--mail-to` from version 1.0.0 are still accepted
+but ignored (a warning says so); the old `softsynk-notify@.service` is removed on the next setup run.
 
 ## Restore
 
@@ -233,7 +236,7 @@ never backed up.
 
 | File | Purpose |
 | --- | --- |
-| `module.toml` | Manifest for the softsynk-server engine (`install`, `configure`, `status`, command `synk-backup`) |
+| `module.toml` | Manifest for the Synk Server Manager engine (`install`, `configure`, `status`, command `synk-backup`) |
 | `setup-backup.sh` | Install and configure wizard (also the non-interactive entry point) |
 | `synk-backup` | The tool: backup, restore, status (Python 3 standard library only) |
 | `systemd/*.in` | Templates for the service, timer and failure-notice units (`@ROOT@`, `@SYNK_BACKUP@` are filled in at install) |
@@ -246,4 +249,4 @@ cannot write TOML). It holds no secrets. `synk-backup config` prints it.
 - Application files, uploads, Redis, and the operating system.
 - Point-in-time recovery (no WAL archiving): you can restore only to the time of a snapshot, up to 6 hours old.
 - Cross-database consistency (see above).
-- Notification beyond a failure e-mail through the local `sendmail`.
+- Notification beyond a failure e-mail (the `notify` module sends it; webhooks are not built).

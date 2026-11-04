@@ -23,7 +23,7 @@ import sys
 import tempfile
 import uuid
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCHEMA = 1
 MODULE = "backup"
 HOST_TAG = "softsynk"                    # fixed restic host, so grouping never depends on the hostname
@@ -1324,8 +1324,8 @@ def validate_all(ctx, cfg, report):
         else:
             states[name] = "error"
             report("fail", f"{name} repository", r.why())
-    if cfg["mail_to"] and not (shutil.which("sendmail") or os.path.exists("/usr/sbin/sendmail")):
-        report("warn", "mail", "no sendmail found; failure mails cannot be sent")
+    if cfg["mail_to"]:  # kept in the config so that old files and --mail-to still load; the address is no longer used
+        report("warn", "mail", "mail_to is deprecated and ignored: failure mails go to the recipients of synk-notify (run synk-notify configure)")
     return states
 
 
@@ -1496,36 +1496,6 @@ def cmd_config(ctx, a):
 def cmd_genpass(ctx, a):
     say(pysecrets.token_urlsafe(24))
     return OK
-
-
-def cmd_notify(ctx, a):
-    if not re.match(r"^[A-Za-z0-9@._:-]{1,128}$", a.unit):
-        raise Fail("invalid unit name", USAGE)
-    cfg = load_config(ctx)
-    if not cfg or not cfg["mail_to"]:
-        say("no mail_to configured; not sending")
-        return OK
-    ctx.cfg = cfg
-    ctx.load_secrets()
-    doc = build_status(ctx)
-    host = socket.gethostname()
-    body = (f"To: {cfg['mail_to']}\nSubject: [softsynk] {a.unit} failed on {host}\n"
-            "Content-Type: text/plain; charset=utf-8\n\n"
-            f"Unit {a.unit} failed on {host} at {iso(now())}.\n\nBackup status: {doc['summary']}\n"
-            + "".join(f"  - {w}\n" for w in doc["warnings"])
-            + "\nInvestigate: synk-backup --status ; journalctl -u softsynk-backup.service\n")
-    sendmail = shutil.which("sendmail") or "/usr/sbin/sendmail"
-    r = run_cmd([sendmail, "-t", "-i"], stdin=_text_file(redact(body)), timeout=60)
-    if not r.ok:
-        raise Fail(f"sendmail failed: {r.why()}")
-    return OK
-
-
-def _text_file(s):
-    f = tempfile.TemporaryFile()
-    f.write(s.encode())
-    f.seek(0)
-    return f
 
 
 # ---------------------------------------------------------------- status (read-only, no lock, no restic)
@@ -1702,7 +1672,7 @@ def build_parser():
     s.add_argument("--local-repo"), s.add_argument("--remote-preset", choices=sorted(PRESETS) + ["custom", "none"])
     for k in ("id", "endpoint", "region", "bucket", "prefix", "repo"):
         s.add_argument(f"--remote-{k}")
-    s.add_argument("--mail-to")
+    s.add_argument("--mail-to", help="deprecated and ignored: failure mails use synk-notify")
     for t in TIERS:
         s.add_argument(f"--retention-{t.replace('_', '-')}", dest=f"retention_{t}", type=int)
     s.add_argument("--compression"), s.add_argument("--exclude-databases", help="comma separated")
@@ -1712,14 +1682,12 @@ def build_parser():
     s.add_argument("--dry-run", action="store_true")
     sub.add_parser("config", parents=[common], help="print the configuration (no secrets) as JSON")
     sub.add_parser("genpass", parents=[common], help="print a new random repository password")
-    s = sub.add_parser("notify", parents=[common], help="mail a failure notice (used by the systemd OnFailure unit)")
-    s.add_argument("--unit", required=True)
     return p
 
 
 COMMANDS = {"run": cmd_run, "check": cmd_check, "restore-test": cmd_restore_test, "restore": cmd_restore,
             "snapshots": cmd_snapshots, "validate": cmd_validate, "configure": cmd_configure,
-            "config": cmd_config, "genpass": cmd_genpass, "notify": cmd_notify}
+            "config": cmd_config, "genpass": cmd_genpass}
 
 
 def main(argv=None):

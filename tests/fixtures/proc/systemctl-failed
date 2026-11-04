@@ -1,0 +1,2 @@
+logrotate.service loaded failed failed Rotate log files
+● softsynk-backup.service loaded failed failed softsynk backup

@@ -1,0 +1,27 @@
+schema = 1
+id = "notify"
+name = "Mail notifications"
+description = "One mail setup (SMTP, Resend, Mailgun or sendmail) for every softsynk tool, plus failure mails for systemd units"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "stores the mail settings under the management root; the SMTP password or API key goes to secrets/notify/smtp.env (mode 0600)",
+  "writes the systemd unit softsynk-alert@.service to /etc/systemd/system and runs systemctl daemon-reload; any unit can then use OnFailure=softsynk-alert@%n.service",
+  "sends mail through the configured SMTP server (or the local sendmail) for test mails and when a unit that uses the alert unit fails",
+  "links /usr/local/bin/synk-notify when bootstrap.sh runs",
+]
+
+# Python 3.11+ (the shared lib needs it) is the only requirement; Ubuntu 24.04 ships 3.12.
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install   = ["synk-notify", "configure"]
+configure = ["synk-notify", "configure"]
+status    = ["synk-notify", "--status-json"]
+
+[commands]
+synk-notify = "synk-notify"

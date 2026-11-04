@@ -33,6 +33,6 @@ body:
     id: env
     attributes:
       label: Environment
-      placeholder: "softsynk-server 0.1.0, Ubuntu 26.04, restic 0.18.1, gum 0.17.0"
+      placeholder: "Synk Server Manager 0.2.0, Ubuntu 26.04, restic 0.18.1, gum 0.17.0"
     validations:
       required: true

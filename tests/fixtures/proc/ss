@@ -1,0 +1,7 @@
+LISTEN 0      4096         0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=812,fd=3))
+LISTEN 0      511          0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=900,fd=6),("nginx",pid=901,fd=6))
+LISTEN 0      4096       127.0.0.1:6379       0.0.0.0:*    users:(("redis-server",pid=77,fd=6))
+LISTEN 0      4096   127.0.0.53%lo:53         0.0.0.0:*
+LISTEN 0      4096            [::]:22            [::]:*
+LISTEN 0      80                 *:3306             *:*
+LISTEN 0      128            [::1]:5432          [::]:*

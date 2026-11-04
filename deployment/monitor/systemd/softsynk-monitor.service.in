@@ -1,0 +1,10 @@
+[Unit]
+Description=softsynk health check (disk, memory, cpu, services)
+@ONFAILURE@
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ --root @ROOT@ check
+Nice=10
+# One check takes a few seconds; a mail transport times out on its own (20 s per SMTP step).
+TimeoutStartSec=120

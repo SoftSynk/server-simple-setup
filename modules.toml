@@ -4,6 +4,10 @@
 schema = 1
 
 [[modules]]
+id = "notify"
+manifest = "deployment/notify/module.toml"
+
+[[modules]]
 id = "backup"
 manifest = "deployment/backup/module.toml"
 
@@ -14,3 +18,19 @@ manifest = "deployment/redis-setup/module.toml"
 [[modules]]
 id = "auto-updates"
 manifest = "deployment/auto-updates/module.toml"
+
+[[modules]]
+id = "housekeeping"
+manifest = "deployment/housekeeping/module.toml"
+
+[[modules]]
+id = "optimizer"
+manifest = "deployment/optimizer/module.toml"
+
+[[modules]]
+id = "monitor"
+manifest = "deployment/monitor/module.toml"
+
+[[modules]]
+id = "hardening"
+manifest = "deployment/hardening/module.toml"

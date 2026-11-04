@@ -1,0 +1,28 @@
+schema = 1
+id = "housekeeping"
+name = "Disk housekeeping"
+description = "Finds what fills the disk, previews what can safely go and deletes it after a yes; caps the journal and rotates Laravel logs"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "setup writes /etc/systemd/journald.conf.d/50-softsynk.conf (journal size cap) and restarts systemd-journald; a failed check puts the old file back",
+  "setup writes /etc/logrotate.d/softsynk-laravel (daily rotation of each detected Laravel app's storage/logs/laravel.log) after logrotate -d accepts it",
+  "synk-clean run deletes only after a preview and a yes: the apt package cache (apt-get clean), journal data above the cap (journalctl --vacuum-size), rotated logs in /var/log, old Laravel logs, crash dumps, and Composer/npm caches only when chosen",
+  "never deletes inside system trees, database data, /var/log/mysql, /var/log/journal or the management root's etc, data, secrets and state; never follows symlinks or crosses filesystems",
+  "stores its config, last-run record and logs under the management root",
+  "links /usr/local/bin/synk-clean when it is missing",
+]
+
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install   = ["synk-clean", "setup"]
+configure = ["synk-clean", "setup"]
+status    = ["synk-clean", "--status-json"]
+
+[commands]
+synk-clean = "synk-clean"

@@ -229,8 +229,16 @@ link_cmd() { # link_cmd NAME TARGET: create, or refresh only when the link is ou
 
 if mkdir -p "$BIN_DIR" 2>/dev/null && [[ -w $BIN_DIR ]]; then
   link_cmd softsynk-server "$ROOT/current/softsynk-server"
-  if [[ -f $FINAL/deployment/backup/synk-backup ]]; then
-    link_cmd synk-backup "$ROOT/current/deployment/backup/synk-backup"
+  # every other command comes from the manifests: "name<TAB>absolute path inside the release"
+  if cmds="$(PYTHONDONTWRITEBYTECODE=1 python3 "$FINAL/softsynk-server" --root "$ROOT" commands 2>/dev/null)"; then
+    real_final="$(cd "$FINAL" && pwd -P)" # the engine prints realpaths
+    while IFS=$'\t' read -r name path; do
+      [[ -n $name ]] || continue
+      if [[ $path == "$real_final"/* ]]; then link_cmd "$name" "$ROOT/current/${path#"$real_final"/}"
+      else warn "command $name points outside the release; not linked"; fi
+    done <<<"$cmds"
+  else
+    warn "could not list module commands; only softsynk-server was linked"
   fi
 else
   warn "cannot write to $BIN_DIR; command links skipped (need root?)"

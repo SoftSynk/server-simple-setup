@@ -1,6 +1,6 @@
-# softsynk-server architecture
+# Synk Server Manager architecture
 
-softsynk-server installs, configures, updates and reports on a small set of server modules (backup, Redis, automatic updates). It is one Python 3 file, `softsynk-server`, that uses only the standard library. It contains no per-module code. A module is a folder with a data-only manifest (`module.toml`) and its own scripts; the engine reads the manifest and runs the module's declared commands.
+Synk Server Manager (`softsynk-server` command) installs, configures, updates and reports on a small set of server modules (notify, backup, Redis, automatic updates, housekeeping, optimizer, monitor, hardening). The engine is one Python 3 file, `softsynk-server`, that uses only the standard library. It contains no per-module code. A module is a folder with a data-only manifest (`module.toml`) and its own scripts; the engine reads the manifest and runs the module's declared commands.
 
 Companion document: [module-development.md](module-development.md) (how to write a module).
 
@@ -13,6 +13,7 @@ Companion document: [module-development.md](module-development.md) (how to write
 | Manifests | `deployment/<module>/module.toml` | Data only: identity, dependencies, platform, and the command (argv array) for each operation. |
 | Bootstrap | `bootstrap.sh` | First install and every update: stage, verify, validate, activate a release; create the root tree and command links. |
 | Version | `VERSION` | The only source of the framework version. |
+| Shared library | `lib/softsynk/` | Code shared by the Python modules (below). The engine does not import it. |
 
 ## Server layout
 
@@ -27,12 +28,13 @@ secrets/<module>/              credentials                      (secrets/ is 070
 state/<module>/                module state and install markers
 state/framework/history.jsonl  one JSON line per install/configure/update/rollback
 log/<module>/                  logs
-data/                          module data (for example the backup repository)
+data/<module>/                 module data (backup repository, monitor history, change backups)
 tmp/<module>/                  scratch space                    (tmp/ is 0700)
 lock/framework.lock            global lock for mutating commands
+lock/<module>.lock             one run at a time per module
 ```
 
-Command links, created by `bootstrap.sh` only when missing or already pointing into `current`: `/usr/local/bin/softsynk-server` and, when the backup module ships it, `/usr/local/bin/synk-backup`. Set `SOFTSYNK_BIN_DIR` to put them elsewhere. A link that points somewhere else is left alone with a warning.
+Command links, created by `bootstrap.sh` only when missing or already pointing into `current`: `/usr/local/bin/softsynk-server` and every command a valid manifest declares under `[commands]` (read with `softsynk-server commands`), for example `synk-backup`, `synk-notify`, `synk-monitor`. Set `SOFTSYNK_BIN_DIR` to put them elsewhere. A link that points somewhere else is left alone with a warning.
 
 Some things stay where the operating system expects them and are outside the root: systemd units, Redis config and data under `/etc/redis` and `/var/lib/redis`, apt configuration, PostgreSQL data, and the two command links.
 
@@ -47,12 +49,13 @@ softsynk-server --rollback                   point current back at the previous 
 softsynk-server --status [--json]            module health (read-only)
 softsynk-server --list                       modules, versions, install state, blockers (read-only)
 softsynk-server validate                     check registry and manifests (read-only; also run by bootstrap)
+softsynk-server commands                     commands the modules ship, name<TAB>path (read-only; bootstrap links them)
 softsynk-server --version | --help
 ```
 
 Global flags: `--root DIR`, `--non-interactive`, `--accept-defaults`, `--dry-run` (install/configure only; it is passed to the module as `SOFTSYNK_DRY_RUN=1`, and the module decides what that means).
 
-Read-only commands (`--status`, `--list`, `validate`, `--version`, `--help`) never install anything, never take the lock, and never write a file or create the root. The tests hash the root and the release before and after to prove it.
+Read-only commands (`--status`, `--list`, `validate`, `commands`, `--version`, `--help`) never install anything, never take the lock, and never write a file or create the root. The tests hash the root and the release before and after to prove it.
 
 ### Interactive and non-interactive
 
@@ -63,6 +66,24 @@ Interactive means a terminal on stdin and stdout, without `--non-interactive` or
 - A bare `softsynk-server` without a terminal prints help to stderr and exits 64.
 
 Prompts use `gum choose`, `gum confirm` and `gum input` with only their basic flags when `gum` is on `PATH`, and a plain numbered prompt otherwise. Ctrl-C or Esc in any prompt cancels (exit 130).
+
+## Shared library and module state
+
+The Python modules (notify, monitor, housekeeping, optimizer, hardening) share `lib/softsynk/`, standard library only: `core` (paths, validated JSON config, atomic writes, locks, logs, status documents), `sysinfo` (readers for `/proc` and systemd), `ui` (prompts with the same non-interactive rules as `lib/ui.sh`), `change` (back up, write, validate, reload, verify and restore for system config files) and `notify` (the one mail sender; backup uses it too). A script adds `lib/` to `sys.path` from its own real path and never writes bytecode, because releases are read-only.
+
+Each module keeps its files in its own folder under the root, one writer per file:
+
+| Path | Holds |
+|---|---|
+| `etc/<module>/config.json` | Settings, no secrets. Unknown keys and wrong types are refused (exit 64). |
+| `secrets/<module>/` | Credentials, files 0600 (for example `notify/smtp.env`). |
+| `state/<module>/` | Current state: last run, `monitor/latest.json`, `monitor/alerts.json`. |
+| `data/<module>/` | Records that grow: `monitor/history/YYYY-MM-DD.jsonl` (7 days, capped), `<module>/backups/<stamp>/` copies of system files a tool changed. |
+| `log/<module>/YYYY-MM.jsonl` | Logs, secrets redacted, pruned after 90 days. |
+
+If the monitor cannot write `state/monitor` (disk full, read-only), it writes `latest.json` and `alerts.json` to `/run/softsynk-monitor` instead and readers use the newer copy, so a full disk does not stop alerts.
+
+Tools that change the system (`synk-harden`, `synk-tune`, the setup of `synk-clean`) follow the same order, written out in each script: Inspect (read-only) → Validate (the current config passes its own check, else refuse) → Recommend → Explain (benefit and risk) → Customize → Preview (diff) → Confirm → Apply (`change.apply`: back up, write, validate, reload) → Verify → Report (summary, log, backup stamp, undo command). Any failed check restores every file and reloads the old config. A run with nothing to change says so and touches nothing.
 
 ## Exit codes
 
@@ -88,7 +109,7 @@ For `--status` the exit code is the worst module, ranked healthy < degraded < un
 ```json
 {
   "schema": 1,
-  "framework": {"version": "0.1.0", "interface": 1},
+  "framework": {"version": "0.2.0", "interface": 1},
   "observed_at": "2026-11-04T12:00:00Z",
   "overall": {"health": "degraded", "exit_code": 1},
   "modules": [ {"module": "...", "name": "...", "version": "...", "observed_at": "...",
@@ -162,6 +183,8 @@ sudo ./bootstrap.sh --from softsynk-server-<VERSION>.tar.gz --sha256 "$EXPECTED_
 
 Linux with Python 3.11 or newer (`tomllib`). Modules declare `[platform] os = ["ubuntu"]` and `min_version`; on any other system they are listed as unsupported and skipped, and `bootstrap.sh` warns when the host is not Ubuntu. `bootstrap.sh --install` installs `gum` through apt only on Ubuntu and only as root; elsewhere it warns and menus fall back to plain prompts.
 
+The notify, monitor, housekeeping, hardening and optimizer modules declare `min_version = "24.04"` because Python 3.11 (shipped by Ubuntu 24.04) is their only requirement; the backup module declares 26.04 for its own tooling.
+
 Test hooks: `SOFTSYNK_OS_RELEASE` (path to an os-release file) and `SOFTSYNK_STATUS_TIMEOUT` (seconds).
 
 ## Tests
@@ -170,4 +193,4 @@ Test hooks: `SOFTSYNK_OS_RELEASE` (path to an os-release file) and `SOFTSYNK_STA
 python3 -m unittest discover -s tests/engine
 ```
 
-The suite builds throwaway releases from `tests/fixtures/` in temporary directories and never touches a real root. It covers validation of every bad-manifest fixture, dependency order, blocking and cycles, status JSON and exit codes, the timeout, read-only guarantees, non-interactive exit 64, the lock, bootstrap, update, rollback, the wrong-checksum refusal, terminal prompts (through a pty), and `shellcheck`.
+The other directories (`tests/lib`, `notify`, `housekeeping`, `optimizer`, `monitor`, `hardening`, `backup`, `deployment`) run the same way; see [CONTRIBUTING.md](../CONTRIBUTING.md). The engine suite builds throwaway releases from `tests/fixtures/` in temporary directories and never touches a real root. It covers validation of every bad-manifest fixture, dependency order, blocking and cycles, status JSON and exit codes, the timeout, read-only guarantees, non-interactive exit 64, the lock, bootstrap, update, rollback, the wrong-checksum refusal, terminal prompts (through a pty), and `shellcheck`.

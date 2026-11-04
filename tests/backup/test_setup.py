@@ -141,6 +141,14 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(call["answer_env"], [], "answers must be consumed, not left in the environment")
         self.assertFalse(os.path.exists(os.path.join(self.root, "log")), "dry run must not write")
 
+    def test_failure_mail_goes_through_the_shared_alert_unit(self):
+        systemd = os.path.join(REPO, "deployment", "backup", "systemd")
+        with open(os.path.join(systemd, "softsynk-backup.service.in")) as f:
+            self.assertIn("OnFailure=softsynk-alert@%n.service", f.read())
+        self.assertFalse(os.path.exists(os.path.join(systemd, "softsynk-notify@.service.in")))
+        r = self.run_setup("--help")
+        self.assertIn("ignored", r.stdout.split("--mail-to", 1)[1].splitlines()[0])
+
     def test_accept_defaults_without_remote(self):
         r = self.run_setup("--dry-run", "--accept-defaults", "--non-interactive",
                            env={"SOFTSYNK_ANSWER_REPO_PASSWORD": PW})
@@ -168,7 +176,7 @@ class SetupTests(unittest.TestCase):
         call = self.configure_call()
         o = self.opts(call["argv"])
         self.assertEqual((o["--local-repo"], o["--mail-to"], o["--exclude-databases"]),
-                         ("/srv/old", "me@example.com", "tmp"))
+                         ("/srv/old", "", "tmp"), "a stored mail_to is ignored now, so a re-run drops it")
         self.assertEqual((o["--remote-preset"], o["--remote-id"], o["--remote-bucket"], o["--remote-prefix"]),
                          ("r2", "acct9", "old-bkt", "old-pfx"))
         self.assertEqual(o["--retention-daily"], "7")

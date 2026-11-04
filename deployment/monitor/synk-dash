@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""synk-dash: a live, read-only view of this server (resources, services, alerts, trends).
+
+Module "monitor". Python 3.11+ standard library plus lib/softsynk. q quits, r refreshes, t flips between the last 24
+hours and 7 days. `--once` (or stdout not being a terminal) prints one plain-text page. It reads what synk-monitor
+records and looks at /proc itself; it never writes. See README.md in this folder.
+"""
+import collections
+import copy
+import curses
+import locale
+import os
+import shutil
+import sys
+import time
+from datetime import datetime, timedelta
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
+
+import monitorlib as ml  # noqa: E402
+from softsynk import core  # noqa: E402
+
+VERSION = "1.0.0"
+MODULE = "monitor"
+MON = "/usr/local/bin/synk-monitor"
+BLOCKS, ASCII = "▁▂▃▄▅▆▇█", "_.-:=+*#"
+ENV = ml.Env()  # everything that touches the host; tests replace it
+SLEEP = time.sleep
+
+
+def spark(values, width, utf8=True):
+    """One character per sample (or per bucket of samples when there are more than `width`): 0..100 percent maps
+    to eight heights, a missing sample is a gap. A short series is not stretched."""
+    n, w = len(values), min(len(values), width)
+    chars, out = (BLOCKS if utf8 else ASCII), ""
+    for i in range(max(w, 0)):
+        b = [v for v in values[i * n // w:(i + 1) * n // w] if isinstance(v, (int, float))]
+        out += " " if not b else chars[min(7, max(0, int(sum(b) / len(b) * 7 / 100 + 0.5)))]
+    return out
+
+
+def step(key, span):
+    """(what, span) for a key press: quit, refresh (also on the 2 s timeout, key -1), or None for any other key."""
+    if key in (ord("q"), ord("Q")):
+        return "quit", span
+    if key == ord("t"):
+        return "refresh", 168 if span == 24 else 24
+    return ("refresh" if key in (ord("r"), -1) else None), span
+
+
+def _now():
+    # Rates need sub-second time; core.now() (the test clock included) is whole seconds.
+    return core.now() if os.environ.get("SOFTSYNK_NOW") else datetime.now().astimezone()
+
+
+def _trend(ctx, now, span):
+    """{metric: [values over the span]} from the monitor's history; {} when there is none."""
+    recs, _ = ml.read_history(ctx.path("data", "history"), now - timedelta(hours=span))
+    out = {}
+    for r in recs:
+        for k, f in (("memory", "mem"), ("cpu", "cpu"), ("swap", "swap")):
+            out.setdefault(k, []).append(r.get(f))
+        for m, v in (r.get("disk") if isinstance(r.get("disk"), dict) else {}).items():
+            out.setdefault(f"disk:{m}", []).append(v)
+    return out
+
+
+def _dicts(x):
+    return [i for i in x if isinstance(i, dict)] if isinstance(x, list) else []
+
+
+def collect(ctx, env, prev=None, sleep=None, span=24):
+    """Everything one frame shows. `prev` is the previous frame's "raw" (cpu and network are rates between two
+    samples); without it the machine is sampled twice around a short wait."""
+    try:
+        cfg = ml.load(ctx)
+    except core.Fail:  # a broken config must not blind the dashboard
+        cfg = copy.deepcopy(ml.DEFAULTS)
+    now = _now()
+    a = ml.sample_fast(prev, env, cfg, now)
+    if prev is None:
+        (sleep or SLEEP)(0.3)
+        now = _now()
+        a = ml.sample_fast(a["raw"], env, cfg, now)
+    latest = ml.read_state(ctx, "latest.json", None, env.run_dir)
+    latest = latest if isinstance(latest, dict) and isinstance(latest.get("snap"), dict) else None
+    alerts = ml.read_state(ctx, "alerts.json", None, env.run_dir)
+    alerts = alerts if isinstance(alerts, dict) else {}
+    mon = {"state": "missing", "age": None, "level": 0}
+    snap = {}
+    if latest:
+        snap = latest["snap"]
+        t, iv = core.parse_iso(latest.get("t")), latest.get("interval")
+        iv = iv if isinstance(iv, (int, float)) and iv > 0 else cfg["check_interval_sec"]
+        age = max(0, int((now - t).total_seconds())) if t else None
+        mon = {"state": "ok" if age is not None and age <= 3 * iv else "stale", "age": age,
+               "level": latest["level"] if latest.get("level") in (0, 1, 2) else 0}
+    svc, failed = snap.get("svc"), snap.get("failed")
+    inc = alerts.get("incident")
+    return {**a, "host": env.host, "now": now, "utf8": "utf" in locale.getpreferredencoding(False).lower(),
+            "span": span, "cfg": cfg, "mon": mon, "incident": inc if isinstance(inc, dict) else None,
+            "closed": _dicts(alerts.get("closed"))[-5:][::-1],
+            "checks": ml.raised({"checks": alerts.get("checks") or {}}),
+            "svc": svc if isinstance(svc, dict) else {}, "failed": failed if isinstance(failed, list) else [],
+            "trend": _trend(ctx, now, span)}
+
+
+def _level(v, t):
+    return "dim" if v is None else "crit" if v >= t["crit"] else "warn" if v >= t["warn"] else ""
+
+
+def _what(key, v):
+    return f"{ml.label(key)} not running" if key.startswith("service:") else ml.headline(key, v)
+
+
+def _list(items, n=3):
+    return ", ".join(items[:n]) + (f" +{len(items) - n}" if len(items) > n else "")
+
+
+def render(data, width, height=None):
+    """The page as [(text, attr)], attr one of "", bold, dim, ok, warn, crit, head. Every line fits `width`; with a
+    `height` the header and the footer stay and the middle is cut."""
+    th, now, u, mon = data["cfg"]["thresholds"], data["now"], data["utf8"], data["mon"]
+    body = []
+
+    def add(text="", attr=""):
+        body.append((text[:width], attr))
+
+    span = "7d" if data["span"] == 168 else f"{data['span']}h"
+    head = (f"softsynk  {data['host']}  {span}  {now:%Y-%m-%d %H:%M}"[:width], "head")
+    foot = ("" if data.get("once") else "q quit  r refresh  t 24h/7d  ") + f"{MON} report"
+
+    if mon["state"] == "missing":
+        add(f"monitor not installed: run {MON} setup", "warn")
+    else:
+        ago = f"last check {ml.dur(mon['age'])} ago" if mon["age"] is not None else "last check unknown"
+        if mon["state"] == "stale":
+            add(f"monitor STALE, {ago} (is the timer running?)", "warn")
+        else:
+            add(f"monitor {ml.WORD[mon['level']]}, {ago}", ("ok", "warn", "crit")[mon["level"]])
+        inc, checks = data["incident"], data["checks"]
+        if inc:
+            level = max((c["level"] for c in checks.values()), default=inc.get("peak", 1))
+            opened = core.parse_iso(inc.get("opened")) or now
+            what = ", ".join(_what(k, c["value"]) for k, c in sorted(checks.items(), key=lambda kc: -kc[1]["level"]))
+            add(f"incident {ml.WORD[level]} for {ml.dur((now - opened).total_seconds())}: {what}", "crit" if level == 2 else "warn")
+        else:
+            add("no open incident", "ok")
+        for c in data["closed"][:3]:
+            opened, closed = core.parse_iso(c.get("opened")), core.parse_iso(c.get("closed"))
+            took = f" after {ml.dur((closed - opened).total_seconds())}" if opened and closed else ""
+            when = f"{closed:%m-%d %H:%M}" if closed else "?"
+            add(f"recovered {when}: {_list([ml.label(k) for k in c.get('keys', [])])}{took}", "dim")
+
+    add()
+    add(f"up {ml.dur(data['uptime']) if data['uptime'] else 'n/a'}   "
+        + (f"load {' '.join(f'{x:.2f}' for x in data['load'])} ({data['ncpu']} cpus)" if data["load"] else "load n/a"))
+    rows = [(k, data[f], None, _level(data[f], th[k]), data["trend"].get(k)) for k, f in (("cpu", "cpu"), ("memory", "mem"), ("swap", "swap"))]
+    for mount, f in data["fs"].items():
+        name, series = ml.label(f"disk:{mount}"), data["trend"].get(f"disk:{mount}")
+        if f is None:
+            rows.append((name, None, None, "dim", series))
+            continue
+        ino = _level(f["inodes_percent"], th["inodes"])
+        lv = {_level(f["percent"], th["disk"]), ino}
+        rows.append((name, f["percent"], f"ino {f['inodes_percent']:.0f}%" if ino in ("warn", "crit") else "",
+                     "crit" if "crit" in lv else "warn" if "warn" in lv else "", series))
+    lw = min(max(len(r[0]) for r in rows), max(8, width // 3))
+    for name, v, extra, attr, series in rows:
+        line = f"{name[:lw]:<{lw}} {'n/a' if v is None else f'{v:.0f}%':>4}  {extra or '':<9}"
+        sp = spark(series, min(40, width - len(line) - 2), u) if series and width >= 60 else ""
+        add(f"{line}  {sp}".rstrip(), attr)
+    add(f"{'net':<{lw}} " + ("n/a" if data["rx"] is None or data["tx"] is None
+                             else f"rx {core.human(data['rx'])}/s  tx {core.human(data['tx'])}/s"))
+
+    if mon["state"] != "missing":
+        add()
+        for unit, st in sorted(data["svc"].items()):
+            add(f"{unit} unknown", "dim") if st == "unknown" else add(f"{unit} up") if st in ml.UP else add(f"{unit} down ({st})", "crit")
+        add("failed units: " + (_list(data["failed"]) if data["failed"] else "none"), "warn" if data["failed"] else "")
+
+    lines = [head, *body, (foot[:width], "dim")]
+    if height and height < len(lines):
+        lines = [head, *body[:height - 2], lines[-1]] if height >= 2 else [head]
+    return lines
+
+
+def loop(scr, ctx, env, sleep, attrs):
+    """Draw, wait for a key (2 s at most), repeat until q. `attrs` maps an attribute name to a curses attribute."""
+    scr.timeout(2000)
+    span, prev = 24, None
+    while True:
+        data = collect(ctx, env, prev, sleep, span)
+        prev = data["raw"]
+        h, w = scr.getmaxyx()
+        scr.erase()
+        for y, (text, attr) in enumerate(render(data, max(w - 1, 1), h)):
+            try:
+                scr.addnstr(y, 0, text, max(w - 1, 1), attrs[attr])
+            except (curses.error, UnicodeError):  # a screen too small or a terminal that cannot show the character
+                pass
+        scr.refresh()
+        what, span = step(scr.getch(), span)
+        if what == "quit":
+            return
+
+
+def run_curses(ctx, env):
+    def go(scr):
+        attrs = collections.defaultdict(int, bold=curses.A_BOLD, dim=curses.A_DIM, head=curses.A_REVERSE | curses.A_BOLD,
+                                        warn=curses.A_BOLD, crit=curses.A_BOLD | curses.A_REVERSE)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i, (name, color) in enumerate((("ok", curses.COLOR_GREEN), ("warn", curses.COLOR_YELLOW), ("crit", curses.COLOR_RED)), 1):
+                curses.init_pair(i, color, -1)
+                attrs[name] = curses.color_pair(i) | (curses.A_BOLD if name == "crit" else 0)
+        loop(scr, ctx, env, SLEEP, attrs)
+    curses.wrapper(go)
+
+
+def main(argv=None):
+    p = core.Parser(prog="synk-dash", description="Live view of this server: resources, services, alerts, trends. "
+                    "Keys: q quit, r refresh, t 24 hours or 7 days.")
+    p.add_argument("--root", help=f"management root (default: $SOFTSYNK_ROOT or {core.DEFAULT_ROOT})")
+    p.add_argument("--once", action="store_true", help="print one plain-text page and exit (also when stdout is not a terminal)")
+    p.add_argument("--version", action="store_true")
+    a = core.parse_args(p, argv)
+    if a.version:
+        print(f"synk-dash {VERSION}")
+        return core.OK
+    try:
+        locale.setlocale(locale.LC_ALL, "")  # curses needs it to draw UTF-8
+    except locale.Error:
+        pass
+    ctx = core.Ctx(MODULE, a.root)
+
+    def run():
+        if a.once or not sys.stdout.isatty():
+            data = collect(ctx, ENV, None, SLEEP)
+            data["once"] = True
+            print("\n".join(t for t, _ in render(data, shutil.get_terminal_size().columns)))
+        else:
+            run_curses(ctx, ENV)
+        return core.OK
+    return core.main(run, "synk-dash")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

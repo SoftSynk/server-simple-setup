@@ -24,12 +24,13 @@ Usage: setup-backup.sh [--configure] [--dry-run] [--root DIR] [--non-interactive
   --root DIR       management root (default $SOFTSYNK_ROOT or /opt/softsynk-server-management)
   --non-interactive, --accept-defaults, --version, --help
 
-Answers (each one skips its prompt; "-" means "none" for the mail address and the exclusions):
+Answers (each one skips its prompt; "-" means "none" for the exclusions):
   --local-repo PATH            --remote-preset none|r2|b2|hetzner|custom
   --remote-id ID               account id (r2) or region / location (b2, hetzner)
   --remote-endpoint URL        custom preset only        --remote-region NAME
   --remote-bucket NAME         --remote-prefix PATH
-  --mail-to ADDRESS            --retention-daily N       --retention-weekly N
+  --mail-to ADDRESS (deprecated, ignored: failure mails use synk-notify)
+  --retention-daily N          --retention-weekly N
   --retention-twice-monthly N  --exclude-databases a,b
 
 Credentials are never accepted as options (a command line is visible to every user via ps). Set them in
@@ -163,7 +164,7 @@ d = json.load(sys.stdin)
 c, r = d["config"], d["config"].get("remote") or {}
 rows = {"local_repo": c["local_repo"], "preset": r.get("preset", "none"), "repo": r.get("repo", ""),
         "endpoint": r.get("endpoint", ""), "region": r.get("region", ""), "bucket": r.get("bucket", ""),
-        "prefix": r.get("prefix") or d["defaults"]["prefix"], "mail_to": c["mail_to"],
+        "prefix": r.get("prefix") or d["defaults"]["prefix"],
         "daily": c["retention"]["daily"], "weekly": c["retention"]["weekly"],
         "twice_monthly": c["retention"]["twice_monthly"], "exclude": ",".join(c["exclude_databases"]),
         "has_password": str(d["has_password"]).lower(), "has_s3_keys": str(d["has_s3_keys"]).lower()}
@@ -172,11 +173,11 @@ for k, v in rows.items():
 ') || out=""
   fi
   D_local_repo="$SOFTSYNK_ROOT/data/backup/restic" D_preset=none D_repo="" D_endpoint="" D_region="" D_bucket=""
-  D_prefix="softsynk-$(hostname -s 2>/dev/null || echo server)" D_mail_to="" D_daily=3 D_weekly=1 D_twice_monthly=2
+  D_prefix="softsynk-$(hostname -s 2>/dev/null || echo server)" D_daily=3 D_weekly=1 D_twice_monthly=2
   D_exclude="" D_has_password=false D_has_s3_keys=false
   while IFS='=' read -r k v; do
     case $k in
-      local_repo | preset | repo | endpoint | region | bucket | prefix | mail_to | daily | weekly | twice_monthly | exclude | \
+      local_repo | preset | repo | endpoint | region | bucket | prefix | daily | weekly | twice_monthly | exclude | \
         has_password | has_s3_keys) printf -v "D_$k" '%s' "$v" ;;
     esac
   done <<<"$out"
@@ -292,8 +293,8 @@ ask_all() {
   ask_required LOCAL_REPO "Local repository path" "$D_local_repo"
   ask_remote
   section "Notifications, retention and exclusions"
-  ask MAIL_TO "E-mail address for failure notices (- = none; needs a working sendmail)" "${D_mail_to:--}"
-  [[ $MAIL_TO != - ]] || MAIL_TO=""
+  MAIL_TO=${SOFTSYNK_ANSWER_MAIL_TO:-}  # deprecated and ignored (failure mails use synk-notify); --mail-to is still accepted
+  unset SOFTSYNK_ANSWER_MAIL_TO
   ask RETENTION_DAILY "Daily snapshots to keep" "$D_daily"
   ask RETENTION_WEEKLY "Weekly snapshots to keep" "$D_weekly"
   ask RETENTION_TWICE_MONTHLY "Twice-monthly snapshots to keep" "$D_twice_monthly"
@@ -364,15 +365,22 @@ link_command() {
 install_units() {
   section "Schedule"
   if [[ $DRY_RUN == 1 ]]; then
-    info "[dry run] would write softsynk-backup.service, softsynk-backup.timer and softsynk-notify@.service to $UNIT_DIR, enable the timer and link $BIN_DIR/synk-backup"
+    info "[dry run] would write softsynk-backup.service and softsynk-backup.timer to $UNIT_DIR, enable the timer and link $BIN_DIR/synk-backup"
     return 0
   fi
   local exe f changed=0
   exe=$(synk_exec)
   install -d -m 0755 -- "$UNIT_DIR"
-  for f in softsynk-backup.service softsynk-backup.timer softsynk-notify@.service; do
+  for f in softsynk-backup.service softsynk-backup.timer; do
     if write_unit "$f" "$exe"; then changed=1; fi
   done
+  # 1.0.0 shipped its own failure-mail unit; failure mails now go through the notify module's softsynk-alert@
+  if [[ -f $UNIT_DIR/softsynk-notify@.service ]]; then
+    rm -f -- "$UNIT_DIR/softsynk-notify@.service"
+    changed=1
+  fi
+  [[ -f $UNIT_DIR/softsynk-alert@.service ]] ||
+    warn "softsynk-alert@.service is not installed, so a failed backup sends no mail. Run: synk-notify configure"
   if command -v systemctl >/dev/null 2>&1; then
     ((changed == 0)) || systemctl daemon-reload
     systemctl enable --now softsynk-backup.timer

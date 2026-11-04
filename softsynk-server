@@ -43,7 +43,7 @@ HEALTH_EXIT = {"healthy": OK, "degraded": DEGRADED, "unhealthy": UNHEALTHY,
 SEVERITY = {OK: 0, DEGRADED: 1, INCOMPLETE: 2, UNHEALTHY: 3}
 OVERALL_LABEL = {OK: "healthy", DEGRADED: "degraded", UNHEALTHY: "unhealthy",
                  INCOMPLETE: "incomplete"}
-COMMANDS = ("install", "configure", "update", "validate")
+COMMANDS = ("install", "configure", "update", "validate", "commands")
 
 
 class Fail(Exception):
@@ -664,6 +664,15 @@ def cmd_validate(ctx, reg):
     return FAILED if bad else OK
 
 
+def cmd_commands(reg):
+    """name<TAB>absolute path of every command declared by a valid manifest (bootstrap links these)."""
+    for e in reg.entries.values():
+        if e.module is not None:
+            for name, path in e.module.commands.items():
+                say(f"{name}\t{path}")
+    return OK
+
+
 # ---------------------------------------------------------------- prompts
 
 def gum_cmd():
@@ -981,6 +990,7 @@ commands:
   configure <module>      run a module's configure operation
   update                  stage, verify and activate a new release (--from DIR|TARBALL [--sha256 HEX])
   validate                check registry and manifests of this release (read-only)
+  commands                list command-line tools the modules ship, name<TAB>path (read-only)
 
 exit codes: 0 ok/healthy, 1 degraded, 2 unhealthy or failed, 3 incomplete/blocked,
             64 invalid request or missing input, 130 cancelled
@@ -1054,6 +1064,8 @@ def main(argv=None):
             return cmd_list(ctx, reg)
         if a.command == "validate":
             return cmd_validate(ctx, reg)
+        if a.command == "commands":
+            return cmd_commands(reg)
         if a.command == "install":
             return cmd_install(ctx, reg, a.modules)
         if a.command == "configure":

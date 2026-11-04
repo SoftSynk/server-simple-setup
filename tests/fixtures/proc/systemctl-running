@@ -1,0 +1,5 @@
+cron.service                  loaded active running Regular Background Program Processing Daemon
+nginx.service                 loaded active running A high performance web server
+php8.3-fpm.service            loaded active running The PHP 8.3 FastCGI Process Manager
+redis-server.service          loaded active running Advanced key-value store
+ssh.service                   loaded active running OpenBSD Secure Shell server

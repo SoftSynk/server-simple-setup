@@ -1,0 +1,8 @@
+[Unit]
+Description=softsynk failure mail for %i
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ --root @ROOT@ unit-failed %i
+# Mail transports time out on their own (20 s per SMTP step); this only stops a hung sendmail.
+TimeoutStartSec=180
