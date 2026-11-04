@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""synk-notify: the one mail setup of softsynk-server-management, and the failure mail for systemd units.
+
+Module "notify". Python 3.11+ standard library plus lib/softsynk. The transport lives in lib/softsynk/notify.py
+(other tools call notify.send()); this file is the operator side: configure, test, send, unit-failed, status.
+The SMTP password is only ever read from a hidden prompt or SOFTSYNK_ANSWER_SMTP_PASSWORD, stored in
+secrets/notify/smtp.env (0600) and never printed, logged or put in argv. See README.md in this folder.
+"""
+import datetime as dt
+import json
+import os
+import re
+import socket
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
+
+from softsynk import core, notify, ui  # noqa: E402
+
+VERSION = "1.0.0"
+MODULE = "notify"
+UNIT = "softsynk-alert@.service"
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,254}$")  # a systemd unit name; never starts with "-"
+FAILURE_GAP = dt.timedelta(hours=6)  # one failure mail per unit in this time
+PRESET_CHOICES = [  # the first word is the preset name
+    "resend - Resend (smtp.resend.com; the password is your Resend API key)",
+    "mailgun - Mailgun (smtp.mailgun.org; login and password are the domain's SMTP credentials)",
+    "custom - any other SMTP server",
+    "sendmail - this server's own sendmail (no password)",
+]
+ANSWERS = {"preset": "PRESET", "to": "TO", "sender": "FROM", "smtp_host": "SMTP_HOST", "smtp_port": "SMTP_PORT",
+           "smtp_security": "SMTP_SECURITY", "smtp_user": "SMTP_USER"}  # option dest -> SOFTSYNK_ANSWER_<NAME>
+
+
+# ---------------------------------------------------------------- status
+
+def build_status(ctx):
+    """Status document (schema 1). A missing config is "not installed"; everything else is judged by what a mail needs."""
+    try:
+        cfg = notify.load(ctx)
+    except core.Fail as f:
+        return core.status_doc(MODULE, VERSION, "installed", "unhealthy", "the notify config is invalid",
+                               warnings=[str(f)], actions=["synk-notify configure"])
+    if cfg is None:
+        return core.status_doc(MODULE, VERSION, "not_installed", "unknown", "mail is not configured",
+                               actions=["synk-notify configure"])
+    warnings, smtp = [], cfg["smtp"]
+    stored = notify.password(ctx)  # registers it, so that nothing below can leak it
+    secret = notify.secret_path(ctx)
+    if cfg["transport"] == "smtp" and smtp["user"] and not stored:
+        warnings.append(f"the SMTP password is missing (expected in {secret}): run synk-notify configure")
+    try:
+        if os.stat(secret).st_mode & 0o077:
+            warnings.append(f"{secret} is readable by other users: run chmod 600 {secret}")
+    except OSError:
+        pass
+    last = notify.last(ctx)
+    if last and last.get("ok") is False:
+        cls = str(last.get("error_class") or "error")
+        warnings.append(f"the last mail failed at {last.get('at')}: {cls}: {str(last.get('error') or '').removeprefix(cls + ': ')}")
+    if not os.path.exists(os.path.join(core.unit_dir(), UNIT)):
+        warnings.append(f"{UNIT} is not installed in {core.unit_dir()}: failure mails of other units will not be sent; run synk-notify configure")
+    where = f"smtp {smtp['host']}:{smtp['port']}" if cfg["transport"] == "smtp" else "sendmail"
+    tail = f"last mail {'sent' if last.get('ok') else 'failed'} {last.get('at')}" if last else "no mail sent yet"
+    details = {"transport": cfg["transport"], "to": cfg["to"], "from": cfg["from"],
+               "smtp": {k: smtp[k] for k in ("host", "port", "security", "user")} if cfg["transport"] == "smtp" else None,
+               "last": {k: last.get(k) for k in ("at", "ok", "transport", "error_class")} if last else None}
+    return core.status_doc(MODULE, VERSION, "installed", "degraded" if warnings else "healthy",
+                           core.redact(f"{where} to {', '.join(cfg['to'])}; {tail}"), details,
+                           [core.redact(w) for w in warnings], ["synk-notify test"])
+
+
+# ---------------------------------------------------------------- unit-failed, send, test
+
+def cmd_unit_failed(ctx, a):
+    """Mail that a systemd unit failed (run by softsynk-alert@<unit>.service). At most one mail per unit per 6 hours."""
+    unit = a.unit
+    if not UNIT_RE.match(unit):
+        raise core.Fail(f"{unit!r} is not a systemd unit name", core.USAGE)
+    path, t = ctx.path("state", "failures.json"), core.now()
+    try:
+        seen = core.read_json(path, {})
+    except core.Corrupt:
+        seen = {}
+    seen = seen if isinstance(seen, dict) else {}
+    last = core.parse_iso(seen.get(unit))
+    if last and dt.timedelta(0) <= t - last < FAILURE_GAP:
+        ui.info(f"{unit}: a failure mail was sent at {seen[unit]}; not sending another within 6 hours")
+        return core.OK
+    status = core.run(["systemctl", "status", "--no-pager", "-n", "20", unit], timeout=30)  # rc 3 is normal for a failed unit
+    body = (f"The systemd unit {unit} failed on {socket.gethostname()} at {core.iso(t)}.\n\n"
+            f"{(status.out or status.err).strip()}\n\nMore of its log:\n  journalctl -u {unit} -n 100 --no-pager\n")
+    ok, detail = notify.send(ctx.root, f"{unit} failed", body)
+    if not ok:
+        ui.error(f"failure mail for {unit} not sent: {detail}")
+        return core.FAILED
+    # ponytail: no lock; two units failing at the same moment can lose one record and send one mail twice at worst
+    seen = {u: s for u, s in seen.items() if (p := core.parse_iso(s)) and dt.timedelta(0) <= t - p < FAILURE_GAP}
+    seen[unit] = core.iso(t)
+    core.write_json(path, seen)
+    ui.ok(detail)
+    return core.OK
+
+
+def cmd_send(ctx, a):
+    """Mail the text on stdin (one mail; used by scripts that have no Python)."""
+    ok, detail = notify.send(ctx.root, a.subject, sys.stdin.read())
+    (ui.ok if ok else ui.error)(detail)
+    return core.OK if ok else core.FAILED
+
+
+def cmd_test(ctx, a):
+    body = f"This is a test mail from synk-notify on {socket.gethostname()}, sent at {core.iso(core.now())}.\nIf you can read it, softsynk mail works.\n"
+    ok, detail = notify.send(ctx.root, "test mail", body)
+    (ui.ok if ok else ui.error)(detail)
+    return core.OK if ok else core.FAILED
+
+
+# ---------------------------------------------------------------- configure
+
+def _unit_text(ctx):
+    with open(os.path.join(HERE, "systemd", UNIT + ".in"), encoding="utf-8") as f:
+        return f.read().replace("@ROOT@", ctx.root).replace("@BIN@", core.exec_path(ctx, __file__))
+
+
+def _current_preset(cfg):
+    host = cfg["smtp"]["host"]
+    if cfg["transport"] == "sendmail":
+        return PRESET_CHOICES[3]
+    if not host:
+        return PRESET_CHOICES[0]
+    return next((c for c in PRESET_CHOICES[:2] if notify.PRESETS[c.split()[0]]["host"] == host), PRESET_CHOICES[2])
+
+
+def ask_config(ctx):
+    """The answers as a validated config dict. Asks everything before anything is written."""
+    try:
+        old = notify.load(ctx) or notify.DEFAULTS
+    except core.Fail:  # an invalid config is what configure is there to fix
+        old = notify.DEFAULTS
+    ui.section("Where mail comes from and goes to")
+    preset = ui.choose("PRESET", "How should this server send mail?", PRESET_CHOICES, _current_preset(old)).split()[0]
+    sendmail = preset == "sendmail"
+    if sendmail and not notify.sendmail_path():
+        raise core.Fail("sendmail was not found on this server; pick an SMTP preset instead.", core.USAGE)
+    to = ui.ask("TO", "Send mail to (comma separated addresses)", ", ".join(old["to"]) or None)
+    default_from = old["from"] if sendmail else old["from"] or None  # smtp needs one; sendmail may leave it empty
+    sender = ui.ask("FROM", "Send mail from (sender address)", default_from)
+    smtp = dict(notify.DEFAULTS["smtp"])
+    if not sendmail:
+        old_smtp = old["smtp"] if old["smtp"]["host"] else {}
+        if preset == "custom":
+            smtp["host"] = ui.ask("SMTP_HOST", "SMTP server host", old_smtp.get("host") or None)
+            smtp["port"] = ui.ask("SMTP_PORT", "SMTP server port", str(old_smtp.get("port", 587)))
+            smtp["security"] = ui.choose("SMTP_SECURITY", "Encryption", list(notify.SECURITY), old_smtp.get("security", "starttls"))
+            smtp["user"] = ui.ask("SMTP_USER", "SMTP login (empty = none)", old_smtp.get("user", ""))
+        else:
+            smtp.update(notify.PRESETS[preset])
+            if not smtp["user"]:  # mailgun: every domain has its own login
+                smtp["user"] = ui.ask("SMTP_USER", "SMTP login of the domain", old_smtp.get("user") or None)
+        try:
+            smtp["port"] = int(smtp["port"])
+        except ValueError:
+            raise core.Fail(f"the SMTP port must be a number, not {smtp['port']!r}", core.USAGE)
+    cfg = {"transport": "sendmail" if sendmail else "smtp", "to": [x.strip() for x in to.split(",") if x.strip()],
+           "from": sender.strip(), "smtp": smtp}
+    problems = notify.check(cfg)
+    if problems:
+        raise core.Fail("; ".join(problems), core.USAGE)
+    return cfg
+
+
+def ask_password(ctx, cfg):
+    """The SMTP password to store, "" when none is needed. A stored one is kept when nobody can be asked."""
+    if cfg["transport"] != "smtp" or not cfg["smtp"]["user"]:
+        return ""
+    stored = core.read_env_file(notify.secret_path(ctx)).get("SMTP_PASSWORD", "")
+    if stored and "SOFTSYNK_ANSWER_SMTP_PASSWORD" not in os.environ and not ui.interactive():
+        core.register_secret(stored)
+        return stored
+    pw = ui.password("SMTP_PASSWORD", "SMTP password or API key" + (" (empty = keep the stored one)" if stored else ""))
+    if not pw and not stored:
+        raise core.Fail("a password is required for this SMTP login", core.USAGE)
+    return pw or stored
+
+
+def cmd_configure(ctx, a):
+    if not core.ROOT_RE.match(ctx.root) or not core.BIN_RE.match(core.exec_path(ctx, __file__)):
+        raise core.Fail("The root and this tool's folder must be absolute paths without spaces or special characters "
+                        "(they are written into a systemd unit).", core.USAGE)
+    for dest, name in ANSWERS.items():
+        if getattr(a, dest, None) is not None:
+            os.environ["SOFTSYNK_ANSWER_" + name] = getattr(a, dest)
+    try:
+        cfg = ask_config(ctx)
+        pw = ask_password(ctx, cfg)
+    finally:  # an answer that was not asked for must not stay in the environment of the commands below
+        for name in (*ANSWERS.values(), "SMTP_PASSWORD"):
+            os.environ.pop("SOFTSYNK_ANSWER_" + name, None)
+    unit, secret = _unit_text(ctx), notify.secret_path(ctx)
+    if a.dry_run:
+        ui.info(f"[dry run] would write {ctx.config_path}:")
+        print(json.dumps(cfg, indent=2, sort_keys=True))
+        ui.info(f"[dry run] would {'store the password in ' + secret if pw else 'remove any stored password from ' + secret}, "
+                f"write {os.path.join(core.unit_dir(), UNIT)} and reload systemd as needed")
+        return core.OK
+    with core.lock(ctx):
+        core.write_if_changed(ctx.config_path, json.dumps(cfg, indent=2, sort_keys=True) + "\n", 0o644)
+        if pw:
+            core.write_env_file(secret, {"SMTP_PASSWORD": pw})
+        elif os.path.exists(secret):
+            os.unlink(secret)  # sendmail or a login-less server: no stale credential stays behind
+        if core.write_if_changed(os.path.join(core.unit_dir(), UNIT), unit, 0o644):
+            ui.info(f"Wrote {os.path.join(core.unit_dir(), UNIT)}")
+            if not core.run(["systemctl", "daemon-reload"], timeout=60).ok:
+                ui.warn("systemctl daemon-reload failed: run it by hand so that the new unit is known")
+    core.log(ctx, "notify.configured", transport=cfg["transport"], to=cfg["to"], smtp_host=cfg["smtp"]["host"])
+    ui.ok("Mail is configured. Send a test mail with: synk-notify test")
+    return core.OK
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    p = core.Parser(prog="synk-notify", description="Mail setup and failure mails for softsynk tools.",
+                    epilog="exit codes: 0 ok, 2 mail not sent, 64 usage or config error, 130 cancelled. --status: 0 healthy, "
+                           "1 degraded, 2 unhealthy, 3 unknown or not configured; --status-json always exits 0.")
+    core.common_args(p)
+    p.add_argument("--status", action="store_true", help="show mail health (read-only); exits by health")
+    p.add_argument("--status-json", action="store_true", help="status JSON for softsynk-server (module contract; always exits 0)")
+    p.add_argument("--version", action="store_true")
+    sub = p.add_subparsers(dest="cmd", parser_class=core.Parser, metavar="COMMAND")
+    s = sub.add_parser("configure", help="choose the mail transport, store the password, install the alert unit")
+    core.common_args(s)
+    s.add_argument("--preset", help="resend, mailgun, custom or sendmail")
+    s.add_argument("--to", help="recipients, comma separated")
+    s.add_argument("--from", dest="sender", help="sender address (required for SMTP)")
+    s.add_argument("--smtp-host"), s.add_argument("--smtp-port"), s.add_argument("--smtp-user")
+    s.add_argument("--smtp-security", help="starttls, tls (implicit TLS) or none (localhost only)")
+    s.epilog = "The password is never an option: enter it at the prompt or set SOFTSYNK_ANSWER_SMTP_PASSWORD."
+    s = sub.add_parser("test", help="send a test mail")
+    core.common_args(s)
+    s = sub.add_parser("send", help="mail the text on stdin")
+    core.common_args(s)
+    s.add_argument("--subject", required=True)
+    s = sub.add_parser("unit-failed", help="mail that a systemd unit failed (used by softsynk-alert@.service)")
+    core.common_args(s)
+    s.add_argument("unit")
+    return p
+
+
+COMMANDS = {"configure": cmd_configure, "test": cmd_test, "send": cmd_send, "unit-failed": cmd_unit_failed}
+
+
+def main(argv=None):
+    p = build_parser()
+    a = core.parse_args(p, argv)
+    ui.setup(a)
+    if a.version:
+        print(f"synk-notify {VERSION}")
+        return core.OK
+    ctx = core.Ctx(MODULE, a.root)
+
+    def run():
+        if a.status_json:
+            return core.show_status(build_status(ctx), True)
+        if a.status:
+            return core.show_status(build_status(ctx), a.json, json_exit_zero=False)
+        if not a.cmd:
+            p.print_help(sys.stderr)
+            return core.USAGE
+        return COMMANDS[a.cmd](ctx, a)
+    return core.main(run, "synk-notify")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

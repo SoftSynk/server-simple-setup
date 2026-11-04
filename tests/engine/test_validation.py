@@ -122,12 +122,13 @@ class ManifestValidation(Base):
         self.assertEqual(r.returncode, 2)
         self.assertIn("cannot read registry", r.stderr)
 
-    def test_real_registry_lists_the_three_planned_modules(self):
+    def test_real_registry_lists_the_shipped_modules(self):
         import tomllib
+        expected = ["notify", "backup", "redis", "auto-updates", "housekeeping", "optimizer", "monitor", "hardening"]
         with open(support.REPO / "modules.toml", "rb") as f:
             data = tomllib.load(f)
         self.assertEqual(data["schema"], 1)
-        self.assertEqual([m["id"] for m in data["modules"]], ["backup", "redis", "auto-updates"])
+        self.assertEqual([m["id"] for m in data["modules"]], expected)
 
 
 class Ordering(Base):

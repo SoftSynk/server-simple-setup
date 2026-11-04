@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""synk-tune: compare PHP, PHP-FPM, Nginx, Apache, Redis and Meilisearch settings with the server's RAM and CPUs.
+
+Module "optimizer". Python 3.11+ standard library plus lib/softsynk. `synk-tune audit` only reports. The one
+change this tool applies is an OPcache drop-in (/etc/php/<ver>/fpm/conf.d/99-softsynk-opcache.ini), written
+through change.apply: php-fpm<ver> -t before and after, reload, verify, and a restore on any failure.
+Every other finding (PHP-FPM pools, Nginx, Apache, Redis, Meilisearch, php.ini) is report only, with the exact
+change to make by hand. Recommendations follow capacity (RAM, CPUs, measured process memory) and favour
+stable over aggressive. See README.md in this folder.
+"""
+import datetime as dt
+import glob
+import json
+import math
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "lib"))
+
+from softsynk import change, core, sysinfo, ui  # noqa: E402
+
+VERSION = "1.0.0"
+MODULE = "optimizer"
+MB = 1024 * 1024
+PAGE = os.sysconf("SC_PAGE_SIZE")
+DROPIN_NAME = "99-softsynk-opcache.ini"
+ID_RE = re.compile(r"^opcache/(\d+\.\d+)/(opcache\.\w+)$")  # the only findings the tool can apply
+DROPIN_RE = re.compile(r"/etc/php/(\d+\.\d+)/fpm/conf\.d/" + re.escape(DROPIN_NAME) + "$")
+# Hash table sizes PHP rounds opcache.max_accelerated_files up to.
+PRIMES = (223, 463, 983, 1979, 3907, 7963, 16229, 32531, 65407, 130987, 262237, 524521, 1048793)
+OPCACHE_KEYS = {  # key: (PHP default, label)
+    "opcache.memory_consumption": (128, "memory (MB)"),
+    "opcache.interned_strings_buffer": (8, "interned strings buffer (MB)"),
+    "opcache.max_accelerated_files": (10000, "file slots"),
+}
+OFF = ("0", "off", "false", "no")
+RANK = {"crit": 0, "warn": 1, "info": 2}
+SERVICES = (("php-fpm", "php-fpm"), ("nginx", "nginx"), ("apache2", "apache"), ("mysqld", "mysql"),
+            ("mariadbd", "mysql"), ("postgres", "postgres"), ("redis-server", "redis"), ("meilisearch", "meilisearch"))
+LOG_TAIL = 256 * 1024
+FILE_LIMIT = 500000
+APP_MARKERS = ("artisan", "composer.json", "index.php", "wp-config.php", "bin/console")
+Finding = ui.Finding
+
+
+def local_now():
+    return core.now().replace(tzinfo=None)  # server logs carry local wall-clock time
+
+
+# ---------------------------------------------------------------- the host (a temp tree in tests)
+
+class Host:
+    """Files of the server, read through one place. fsroot other than "/" is a test tree; logical paths
+    (what findings and logs show) stay the real ones, p() maps them to the tree."""
+
+    def __init__(self, fsroot="/", cpus=None):
+        self.fsroot = fsroot.rstrip("/") or "/"
+        self.real = self.fsroot == "/"
+        self.cpus = cpus or sysinfo.ncpu()
+
+    def p(self, path):
+        return path if self.real else self.fsroot + "/" + path.lstrip("/")
+
+    def read(self, path, limit=None):
+        """Text of the file (the last `limit` bytes with a limit), or None."""
+        try:
+            with open(self.p(path), "rb") as f:
+                if limit:
+                    f.seek(0, os.SEEK_END)
+                    f.seek(max(0, f.tell() - limit))
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+
+    def exists(self, path):
+        return os.path.exists(self.p(path))
+
+    def listdir(self, path):
+        try:
+            return sorted(os.listdir(self.p(path)))
+        except OSError:
+            return []
+
+    def glob(self, pattern):
+        found = sorted(glob.glob(self.p(pattern)))
+        return found if self.real else [x[len(self.fsroot):] for x in found]
+
+
+# ---------------------------------------------------------------- sizing rules
+
+def parse_size(s):
+    """Bytes from a PHP, nginx or Redis size ("128M", "1g", "512k", "2gb", "-1"); None when it is not one."""
+    m = re.fullmatch(r"\s*(-?\d+)\s*([kKmMgG]?)[bB]?\s*", s or "")
+    if not m:
+        return None
+    n = int(m[1])
+    return n if n < 0 else n * {"": 1, "k": 1024, "m": MB, "g": 1024 * MB}[m[2].lower()]
+
+
+def budget_mb(ram_mb, others_mb):
+    """RAM left for one kind of worker: all RAM, minus a reserve (10%, at least 512 MB) for the system and
+    page cache, minus the other services with 20% headroom."""
+    return ram_mb - max(512, ram_mb * 0.1) - 1.2 * others_mb
+
+
+def size_children(budget, worker, cur):
+    """Workers that fit the budget: never below 2, never more than double the current value (stable over aggressive)."""
+    return max(2, min(int(budget // worker), 2 * cur))
+
+
+def spare_servers(n):
+    """(start_servers, min_spare_servers, max_spare_servers) for a dynamic pool of n children: 1 <= min <= start <= max <= n."""
+    lo = max(1, math.ceil(n / 4))
+    return lo, lo, min(n, max(2, math.ceil(n / 2)))
+
+
+def worker_mb(samples_mb, assumed):
+    """(MB per worker, measured). Measured is the biggest of 2 or more running workers plus 25% headroom."""
+    if len(samples_mb) >= 2:
+        return max(samples_mb) * 1.25, True
+    return assumed, False
+
+
+# ---------------------------------------------------------------- ini parsing (php.ini and php-fpm pools)
+
+def ini_value(v):
+    v = v.strip()
+    if v and v[0] in "\"'":
+        end = v.find(v[0], 1)
+        return v[1:end] if end > 0 else v[1:]
+    return v.split(";", 1)[0].strip()
+
+
+def ini_lines(text):
+    """(section, key, value) for each setting; comments and blank lines are skipped."""
+    section = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in ";#":
+            continue
+        if line[0] == "[" and line.endswith("]"):
+            section = line[1:-1]
+            continue
+        k, eq, v = line.partition("=")
+        if eq:
+            yield section, k.strip(), ini_value(v)
+
+
+def php_ini_files(host, ver):
+    """The files PHP-FPM reads, in load order: php.ini, then conf.d alphabetically."""
+    base = f"/etc/php/{ver}/fpm"
+    return [f for f in [f"{base}/php.ini", *host.glob(f"{base}/conf.d/*.ini")] if host.exists(f)]
+
+
+def ini_entries(host, files):
+    return [(k, v, f) for f in files for _, k, v in ini_lines(host.read(f) or "")]
+
+
+def effective(entries):
+    """{key: (value, source file)}, the last file that sets a key wins."""
+    return {k: (v, src) for k, v, src in entries}
+
+
+def opcache_loaded(entries):
+    return any(k == "zend_extension" and "opcache" in os.path.basename(v) for k, v, _ in entries)
+
+
+def fpm_pools(host, ver):
+    """[{"name", "file", "conf": {key: value}}] for every pool section under pool.d."""
+    pools = {}
+    for f in host.glob(f"/etc/php/{ver}/fpm/pool.d/*.conf"):
+        for sec, k, v in ini_lines(host.read(f) or ""):
+            if sec:
+                pools.setdefault(sec, {"name": sec, "file": f, "conf": {}})["conf"][k] = v
+    return list(pools.values())
+
+
+def fpm_log(host, ver):
+    for _, k, v in ini_lines(host.read(f"/etc/php/{ver}/fpm/php-fpm.conf") or ""):
+        if k == "error_log" and v.startswith("/"):
+            return v
+    return f"/var/log/php{ver}-fpm.log"
+
+
+SATURATED = re.compile(r"^\[(\d\d-\w{3}-\d{4} \d\d:\d\d:\d\d)(?:\.\d+)?\] WARNING: \[pool ([^\]]+)\] server reached pm\.max_children", re.M)
+
+
+def saturation(host, ver, hours):
+    """{pool: times pm.max_children was reached in the last `hours`}, from the tail of the FPM log."""
+    cutoff = local_now() - dt.timedelta(hours=hours)
+    out = {}
+    for m in SATURATED.finditer(host.read(fpm_log(host, ver), LOG_TAIL) or ""):
+        try:
+            when = dt.datetime.strptime(m[1], "%d-%b-%Y %H:%M:%S")
+        except ValueError:
+            continue
+        if when >= cutoff:
+            out[m[2]] = out.get(m[2], 0) + 1
+    return out
+
+
+# ---------------------------------------------------------------- nginx and apache
+
+def nginx_text(host, path="/etc/nginx/nginx.conf", seen=None, depth=0):
+    """The config with comments removed and `include` lines replaced by the files they name."""
+    seen = set() if seen is None else seen
+    text = host.read(path)
+    if text is None or path in seen or depth > 6:
+        return ""
+    seen.add(path)
+
+    def expand(m):
+        pat = m[1].strip().strip("\"'")
+        pat = pat if pat.startswith("/") else "/etc/nginx/" + pat
+        return "\n".join(nginx_text(host, f, seen, depth + 1) for f in host.glob(pat))
+    return re.sub(r"(?<![\w$.-])include\s+([^;{}]+?)\s*;", expand, re.sub(r"#[^\n]*", "", text))
+
+
+def directive(text, name):
+    return [m[1] for m in re.finditer(rf"(?<![\w$.-]){name}\s+([^;{{}}]*?)\s*;", text)]
+
+
+def nginx_settings(host):
+    text = nginx_text(host)
+    if not host.exists("/etc/nginx/nginx.conf"):
+        return None
+    num = lambda name, default: next((int(v) for v in directive(text, name) if v.isdigit()), default)  # noqa: E731
+    bodies = [parse_size(v) for v in directive(text, "client_max_body_size")]
+    bodies = [sys.maxsize if b == 0 else b for b in bodies if b is not None]
+    return {"worker_processes": next(iter(directive(text, "worker_processes")), "1"),
+            "worker_connections": num("worker_connections", 512),
+            "gzip": "on" if "on" in directive(text, "gzip") else "off",
+            "gzip_types": bool(directive(text, "gzip_types")),
+            "body": max(bodies, default=MB),
+            "rlimit": num("worker_rlimit_nofile", None)}
+
+
+def apache_settings(host):
+    mpm = next((m for m in ("event", "worker", "prefork") if host.exists(f"/etc/apache2/mods-enabled/mpm_{m}.load")), None)
+    if not mpm:
+        return None
+    text = host.read(f"/etc/apache2/mods-enabled/mpm_{mpm}.conf") or ""
+
+    def num(name, default):
+        m = re.search(rf"^\s*{name}\s+(\d+)", text, re.M | re.I)
+        return int(m[1]) if m else default
+    return {"mpm": mpm, "max_workers": num("MaxRequestWorkers", 150), "threads": num("ThreadsPerChild", 25)}
+
+
+# ---------------------------------------------------------------- processes and applications
+
+def scan_procs(host):
+    """[{"pid", "comm", "cmd", "pss" bytes, "exact"}]. PSS (shared pages split fairly) when readable, else RSS."""
+    out = []
+    for name in host.listdir("/proc"):
+        d = f"/proc/{name}"
+        comm = host.read(f"{d}/comm") if name.isdigit() else None
+        if comm is None:
+            continue
+        m = re.search(r"^Pss:\s+(\d+) kB", host.read(f"{d}/smaps_rollup") or "", re.M)
+        statm = (host.read(f"{d}/statm") or "").split()
+        if m:
+            pss, exact = int(m[1]) * 1024, True
+        elif len(statm) > 1 and statm[1].isdigit():
+            pss, exact = int(statm[1]) * PAGE, False
+        else:
+            continue
+        cmd = (host.read(f"{d}/cmdline") or "").replace("\0", " ").strip()
+        out.append({"pid": int(name), "comm": comm.strip(), "cmd": cmd, "pss": pss, "exact": exact})
+    return out
+
+
+def overview(procs, ram):
+    """Memory per known service, biggest first: [{"name", "pss", "percent"}]."""
+    use = {}
+    for p in procs:
+        name = next((n for prefix, n in SERVICES if p["comm"].startswith(prefix)), None)
+        if name:
+            use[name] = use.get(name, 0) + p["pss"]
+    return [{"name": n, "pss": v, "percent": round(100 * v / ram, 1)} for n, v in sorted(use.items(), key=lambda kv: -kv[1])]
+
+
+def count_php_files(host, limit=FILE_LIMIT):
+    """(PHP files in the apps of this server, complete). Apps are the directories under /var/www and /home/*
+    that hold a framework marker file; a zero-downtime layout counts only `current`. Vendor code counts (it is
+    loaded too), .git and node_modules do not. Stops at `limit` with complete=False."""
+    seen, count = set(), 0
+    for pattern in ("/var/www/*", "/home/*/*"):
+        for cand in host.glob(pattern):
+            phys = host.p(cand)
+            real = os.path.realpath(os.path.join(phys, "current") if os.path.isdir(os.path.join(phys, "current")) else phys)
+            if real in seen or not os.path.isdir(real) or not any(os.path.exists(os.path.join(real, m)) for m in APP_MARKERS):
+                continue
+            seen.add(real)
+            for _, dirs, files in os.walk(real):
+                dirs[:] = [d for d in dirs if d not in (".git", "node_modules")]
+                count += sum(f.endswith(".php") for f in files)
+                if count >= limit:
+                    return limit, False
+    return count, True
+
+
+# ---------------------------------------------------------------- OPcache
+
+def prime_slots(n):
+    """The slot count PHP really allocates for opcache.max_accelerated_files = n."""
+    return next((p for p in PRIMES if p >= n), PRIMES[-1])
+
+
+def opcache_wanted(files):
+    """Settings for an app of `files` PHP files: ~12 KB of cache each, strings buffer by size, 30% room for new files."""
+    mem = 128
+    while mem * 1024 < files * 12 and mem < 16384:
+        mem *= 2
+    return {"opcache.memory_consumption": mem,
+            "opcache.interned_strings_buffer": 8 if files <= 10000 else 16 if files <= 30000 else 32,
+            "opcache.max_accelerated_files": min(prime_slots(max(10000, math.ceil(files * 1.3))), 1000000)}
+
+
+def check_opcache(key, value):
+    """Problem text for an unacceptable value, or None."""
+    if key == "opcache.enable":
+        return None if value in ("0", "1") else "must be 0 or 1"
+    lo, hi = {"opcache.memory_consumption": (8, 16384), "opcache.interned_strings_buffer": (4, 4096),
+              "opcache.max_accelerated_files": (200, 1000000)}[key]
+    return None if value.isdigit() and lo <= int(value) <= hi else f"must be a whole number from {lo} to {hi}"
+
+
+def dropin_path(ver):
+    return f"/etc/php/{ver}/fpm/conf.d/{DROPIN_NAME}"
+
+
+def render_dropin(vals):
+    return "; Managed by synk-tune. Change it with synk-tune; undo with synk-tune rollback.\n" + \
+        "".join(f"{k} = {v}\n" for k, v in sorted(vals.items()))
+
+
+def verify_opcache(host, ver, vals):
+    """None when PHP would load every wanted value, else which file wins instead."""
+    eff = effective(ini_entries(host, php_ini_files(host, ver)))
+    for key, want in vals.items():
+        got = eff.get(key)
+        if got is None or got[0] != str(want):
+            return f"{key} is {got[0] if got else 'unset'}" + (f" in {got[1]}" if got else "") + f", wanted {want}"
+    return None
+
+
+def opcache_findings(ver, entries, eff, files, ram_mb):
+    mk = lambda fid, sev, *a, **kw: Finding(f"opcache/{ver}/{fid}", sev, *a, **kw)  # noqa: E731
+    how = f"php-fpm{ver} -t checks the change, php{ver}-fpm is reloaded (no downtime) and synk-tune rollback undoes it."
+    if not opcache_loaded(entries) and tuple(map(int, ver.split("."))) < (8, 5):  # PHP 8.5 builds OPcache in
+        return [mk("extension", "warn", f"PHP {ver}: OPcache is not loaded", "no zend_extension=opcache in the FPM config",
+                   f"Install it: apt install php{ver}-opcache, then reload php{ver}-fpm",
+                   "PHP compiles every file on every request without it; OPcache typically makes PHP several times faster",
+                   "Report only. A package install is not something synk-tune does.")]
+    en = eff.get("opcache.enable")
+    if en and en[0].lower() in OFF:
+        return [mk("opcache.enable", "warn", f"PHP {ver}: OPcache is switched off", f"opcache.enable = {en[0]} ({en[1]})", "1",
+                   "PHP stops compiling every file on every request", how,
+                   check=lambda v: check_opcache("opcache.enable", v))]
+    out = []
+    vt = eff.get("opcache.validate_timestamps")
+    if vt and vt[0].lower() in OFF:
+        out.append(mk("validate_timestamps", "info", f"PHP {ver}: OPcache does not check for changed files",
+                      f"opcache.validate_timestamps = {vt[0]} ({vt[1]})", "No change; this is normal for production",
+                      "Fastest setting", f"Code changes are only picked up after a reload: run systemctl reload php{ver}-fpm after each deploy."))
+    if not files:
+        return out
+    want = opcache_wanted(files)
+    want["opcache.memory_consumption"] = min(want["opcache.memory_consumption"], max(128, ram_mb // 8))
+    for key, (default, label) in OPCACHE_KEYS.items():
+        raw = eff.get(key)
+        cur = int(raw[0]) if raw and raw[0].isdigit() else default
+        if (prime_slots(cur) if key == "opcache.max_accelerated_files" else cur) >= want[key]:
+            continue  # raise only, never lower an operator's value
+        src = raw[1] if raw else None
+        if src and os.path.dirname(src).endswith("/conf.d") and os.path.basename(src) > DROPIN_NAME:
+            out.append(mk(f"override/{key}", "warn", f"PHP {ver}: {key} is set too low by a later file",
+                          f"{key} = {raw[0]} ({src})", f"Raise it in {src}, or remove that line, to at least {want[key]}",
+                          f"Fits the {files} PHP files found on this server",
+                          f"Report only: {src} loads after {DROPIN_NAME}, so a drop-in could not change it."))
+            continue
+        ram = f" Reserves {want[key]} MB of RAM for the cache." if key == "opcache.memory_consumption" else ""
+        out.append(mk(key, "info", f"PHP {ver}: raise OPcache {label}", f"{key} = {cur}" + ("" if raw else " (default)"),
+                      str(want[key]), f"Fits the {files} PHP files found in the apps on this server, so the cache does not fill up and recompile.",
+                      "Raise only." + ram + " " + how, check=lambda v, k=key: check_opcache(k, v)))
+    return out
+
+
+# ---------------------------------------------------------------- the other findings (report only)
+
+def upload_limits(eff):
+    def get(k, default):
+        return max(0, parse_size(eff[k][0] if k in eff else default) or 0)
+    return get("upload_max_filesize", "2M"), get("post_max_size", "8M")
+
+
+def php_findings(ver, eff, ram_mb):
+    out, ini = [], f"/etc/php/{ver}/fpm/php.ini"
+    ml = eff.get("memory_limit")
+    if ml and parse_size(ml[0]) == -1:
+        new = "128M" if ram_mb < 1536 else "256M"
+        out.append(Finding(f"php/{ver}/memory_limit", "warn", f"PHP {ver}: memory_limit is unlimited", f"memory_limit = -1 ({ml[1]})",
+                           f"memory_limit = {new}", "One runaway request can no longer use all RAM and bring the OOM killer in",
+                           f"Scripts that need more (imports, exports) then fail with 'Allowed memory size exhausted'. Report only: edit {ml[1]}, then reload php{ver}-fpm."))
+    up, post = upload_limits(eff)
+    if up and 0 < post < up:
+        src = eff["post_max_size"][1] if "post_max_size" in eff else ini
+        out.append(Finding(f"php/{ver}/post_max_size", "warn", f"PHP {ver}: post_max_size is smaller than upload_max_filesize",
+                           f"post_max_size = {core.human(post)}, upload_max_filesize = {core.human(up)}",
+                           f"post_max_size = {math.ceil(up / MB) + 2}M", "Uploads up to the upload limit are no longer cut off silently",
+                           f"Large uploads can use more memory. Report only: edit {src}, then reload php{ver}-fpm."))
+    return out
+
+
+def fpm_findings(host, versions, procs, ram_mb):
+    neigh = sum(p["pss"] for p in procs if not p["comm"].startswith("php-fpm")) / MB
+    budget = budget_mb(ram_mb, neigh)
+    pools = []
+    for v in versions:
+        for pool in fpm_pools(host, v):
+            cur = pool["conf"].get("pm.max_children", "")
+            if cur.isdigit() and int(cur) > 0:
+                pools.append((v, pool, int(cur)))
+    total = sum(c for _, _, c in pools)
+    out = []
+    for v, pool, cur in pools:
+        name, conf, file = pool["name"], pool["conf"], pool["file"]
+        samples = [p["pss"] / MB for p in procs if p["comm"] == f"php-fpm{v}" and p["cmd"] == f"php-fpm: pool {name}"]
+        w, measured = worker_mb(samples, 64)
+        share = budget * cur / total
+        new = size_children(share, w, cur)
+        n = saturation(host, v, 24 * 7).get(name, 0)
+        seen = f" (reached {n} time{'s' if n != 1 else ''} in the last 7 days)" if n else ""
+        size = f"{w:.0f} MB per worker, " + (f"measured from {len(samples)} running workers" if measured else "assumed: fewer than 2 workers are running")
+        spare = ""
+        if conf.get("pm") == "dynamic":
+            spare = ", " + ", ".join(f"{k} = {x}" for k, x in zip(("pm.start_servers", "pm.min_spare_servers", "pm.max_spare_servers"), spare_servers(new)))
+        fid, how = f"fpm/{v}/{name}/max_children", f"Report only: edit {file}, run php-fpm{v} -t, then systemctl reload php{v}-fpm."
+        common = dict(current=f"pm.max_children = {cur}{seen}", proposed=f"pm.max_children = {new}{spare}")
+        if cur > new * 1.2:
+            out.append(Finding(fid, "warn", f"PHP {v} pool {name}: max_children is more than RAM allows", benefit=
+                               f"{cur} workers could use about {cur * w:.0f} MB; this pool's share of RAM is about {share:.0f} MB. "
+                               "A lower limit queues requests in a spike instead of running the server out of memory.",
+                               risk=f"Requests wait when all {new} workers are busy. {size}. {how}", **common))
+        elif n and new > cur * 1.2:
+            out.append(Finding(fid, "info", f"PHP {v} pool {name}: max_children was reached and RAM allows more",
+                               benefit="Fewer queued or slow requests at busy times.",
+                               risk=f"More workers use more RAM at peak. {size}. {how}", **common))
+        elif n:
+            out.append(Finding(fid, "info", f"PHP {v} pool {name}: max_children was reached and there is no RAM to raise it",
+                               current=common["current"], proposed="No safe change: reduce memory per worker, add RAM, or move other services away",
+                               benefit="Avoids swapping or the OOM killer.", risk=f"{size}. {how}"))
+        mr = conf.get("pm.max_requests", "")
+        if not (mr.isdigit() and int(mr) > 0):
+            out.append(Finding(f"fpm/{v}/{name}/max_requests", "info", f"PHP {v} pool {name}: workers are never recycled",
+                               "pm.max_requests is not set (a worker lives until FPM stops)", "pm.max_requests = 500",
+                               "Caps slow memory growth in long-lived workers.", f"A worker restarts every 500 requests (a little CPU). {how}"))
+    return out
+
+
+def open_files_limit(host, procs):
+    vals = []
+    for p in procs:
+        if p["comm"] == "nginx":
+            m = re.search(r"^Max open files\s+(\d+)", host.read(f"/proc/{p['pid']}/limits") or "", re.M)
+            if m:
+                vals.append(int(m[1]))
+    return min(vals, default=None)
+
+
+def nginx_findings(host, procs, effs):
+    s = nginx_settings(host)
+    if not s:
+        return []
+    how = "Report only: edit the nginx config, run nginx -t, then systemctl reload nginx."
+    out, ws, cur = [], s["worker_processes"], s["worker_connections"]
+    if ws.isdigit() and int(ws) < host.cpus:
+        out.append(Finding("nginx/worker_processes", "info", "Nginx: fewer worker processes than CPUs", f"worker_processes {ws};",
+                           "worker_processes auto;", f"Uses all {host.cpus} CPUs to handle connections.", f"None noticeable. {how}"))
+    if s["gzip"] != "on" or not s["gzip_types"]:
+        out.append(Finding("nginx/gzip", "info", "Nginx: compression is off or limited to HTML",
+                           f"gzip {s['gzip']};" + ("" if s["gzip"] == "off" else " (no gzip_types)"),
+                           "gzip on; gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;",
+                           "Smaller CSS, JS and JSON responses, faster pages.", f"A little CPU per response. {how}"))
+    want = max((max(upload_limits(e)) for e in effs.values()), default=0)
+    if want and s["body"] < want:
+        out.append(Finding("nginx/body_size", "warn", "Nginx: request size limit is below the PHP upload limit",
+                           f"client_max_body_size {core.human(s['body'])}", f"client_max_body_size {math.ceil(want / MB)}M;",
+                           "Uploads PHP would accept are no longer refused by nginx with 413.", f"Larger request bodies are allowed. {how}"))
+    log = host.read("/var/log/nginx/error.log", LOG_TAIL) or ""
+    cutoff = local_now() - dt.timedelta(days=7)
+    for m in re.finditer(r"^(\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[\w+\] .*worker_connections are not enough", log, re.M):
+        if dt.datetime.strptime(m[1], "%Y/%m/%d %H:%M:%S") >= cutoff:
+            out.append(Finding("nginx/worker_connections", "warn", "Nginx: ran out of worker connections in the last 7 days",
+                               f"worker_connections {cur};", f"worker_connections {cur * 2};",
+                               "Stops connections being refused at peak.", f"More open file descriptors at peak. {how}"))
+            cur *= 2
+            break
+    limit = s["rlimit"] or open_files_limit(host, procs)
+    if limit is not None and limit < 2 * cur:
+        out.append(Finding("nginx/worker_fds", "warn", "Nginx: open file limit is low for the connection count",
+                           f"limit {limit}, worker_connections {cur}", f"worker_rlimit_nofile {2 * cur};",
+                           "Each proxied connection can use two file descriptors; this keeps nginx from hitting the limit.",
+                           f"None noticeable. {how}"))
+    return out
+
+
+def apache_findings(host, procs, ram_mb):
+    s = apache_settings(host)
+    mine = [p for p in procs if p["comm"] == "apache2"]
+    if not s or not mine:
+        return []
+    per = max(p["pss"] for p in mine) / MB * 1.25
+    budget = budget_mb(ram_mb, sum(p["pss"] for p in procs if p["comm"] != "apache2") / MB)
+    threaded = s["mpm"] != "prefork"
+    children = max(1, s["max_workers"] // s["threads"]) if threaded else s["max_workers"]
+    if children * per <= budget:
+        return []
+    fit = max(1, int(budget // per))
+    return [Finding("apache/max_request_workers", "warn", "Apache: MaxRequestWorkers can use more RAM than the server has",
+                    f"MaxRequestWorkers {s['max_workers']} ({s['mpm']} MPM): worst case about {children * per:.0f} MB, RAM budget {budget:.0f} MB",
+                    f"MaxRequestWorkers {fit * s['threads'] if threaded else fit}",
+                    "A traffic spike no longer exhausts RAM (swapping or the OOM killer).",
+                    f"Requests queue once the limit is reached. {per:.0f} MB per process, measured. Report only: edit "
+                    f"/etc/apache2/mods-enabled/mpm_{s['mpm']}.conf, run apache2ctl configtest, then reload apache2.")]
+
+
+def redis_findings(ctx, host):
+    for f in host.glob("/etc/redis/*.conf"):
+        for line in (host.read(f) or "").splitlines():
+            m = re.match(r"\s*maxmemory\s+(\S+)", line)
+            if m and parse_size(m[1]):
+                return []
+    return [Finding("redis/tuning", "info", "Redis: no memory limit", "no maxmemory in /etc/redis",
+                    f"Run {ctx.root}/current/softsynk-server configure redis (sets maxmemory, eviction and persistence for the workload)",
+                    "Redis cannot grow until it takes the whole server.", "Report only: the redis module changes the config, with a backup and a check.")]
+
+
+def meilisearch_findings(host, procs, ram_mb):
+    mine = [p for p in procs if p["comm"] == "meilisearch"]
+    capped = re.search(r"^\s*max_indexing_memory\s*=", host.read("/etc/meilisearch.toml") or "", re.M) or any(
+        "MEILI_MAX_INDEXING_MEMORY=" in (host.read(f"/proc/{p['pid']}/environ") or "") or "--max-indexing-memory" in p["cmd"] for p in mine)
+    if capped:
+        return []
+    return [Finding("meilisearch/indexing_memory", "info", "Meilisearch: indexing memory is not capped", "max_indexing_memory is not set",
+                    f'max_indexing_memory = "{max(256, ram_mb // 4)} MiB"', "Indexing cannot take most of the RAM and starve PHP or the database.",
+                    "Indexing is slower on big imports. Report only: set it in /etc/meilisearch.toml, then restart meilisearch.")]
+
+
+# ---------------------------------------------------------------- audit
+
+def audit(ctx, host, run=core.run):
+    """Read-only. {"ram" bytes, "cpus", "services", "findings"}; findings sorted by severity then id."""
+    mem = sysinfo.parse_meminfo(host.read("/proc/meminfo") or "")
+    if not mem["total"]:
+        raise core.Fail("Cannot read the memory size from /proc/meminfo.")
+    ram, ram_mb = mem["total"], mem["total"] // MB
+    procs = scan_procs(host)
+    units = set(sysinfo.running_services((), run))
+    versions = [v for v, subs in sysinfo.php_versions(host.p("/etc/php")).items() if "fpm" in subs and f"php{v}-fpm.service" in units]
+    findings, effs = [], {}
+    if versions:
+        files = count_php_files(host)[0]
+        for v in versions:
+            entries = ini_entries(host, php_ini_files(host, v))
+            effs[v] = effective(entries)
+            findings += php_findings(v, effs[v], ram_mb) + opcache_findings(v, entries, effs[v], files, ram_mb)
+        findings += fpm_findings(host, versions, procs, ram_mb)
+    if "nginx.service" in units:
+        findings += nginx_findings(host, procs, effs)
+    if "apache2.service" in units:
+        findings += apache_findings(host, procs, ram_mb)
+    if any(u.startswith("redis-server") for u in units):
+        findings += redis_findings(ctx, host)
+    if "meilisearch.service" in units:
+        findings += meilisearch_findings(host, procs, ram_mb)
+    findings.sort(key=lambda f: (RANK[f.severity], f.id))
+    return {"ram": ram, "cpus": host.cpus, "services": overview(procs, ram), "findings": findings}
+
+
+def applicable(f):
+    return bool(ID_RE.match(f.id))
+
+
+def cmd_audit(ctx, a, host, run):
+    res = audit(ctx, host, run)
+    fs = res["findings"]
+    print(f"Server: {core.human(res['ram'])} RAM, {res['cpus']} CPUs\n")
+    if res["services"]:
+        ui.table([(s["name"], core.human(s["pss"]), f"{s['percent']}%") for s in res["services"]], ("Service", "Memory", "Share of RAM"))
+    if not fs:
+        print("\nNo recommendations: nothing needs tuning right now.")
+    for f in fs:
+        print(f"\n[{f.severity}] {f.title}" + ("" if applicable(f) else "  (report only)"))
+        for label, text in (("Current", f.current), ("Proposed", f.proposed), ("Benefit", f.benefit), ("Risk", f.risk)):
+            print(f"    {label + ':':<10}{text}")
+    if any(applicable(f) for f in fs):
+        print("\nApply the OPcache changes with: synk-tune")
+    return core.OK
+
+
+# ---------------------------------------------------------------- apply and rollback
+
+def need_root(host):
+    if host.real and os.geteuid() != 0:
+        raise core.Fail("Run synk-tune as root: it writes under /etc/php and reloads PHP-FPM.", core.USAGE)
+
+
+def cmd_tune(ctx, a, host, run):
+    need_root(host)
+    with core.lock(ctx):
+        findings = audit(ctx, host, run)["findings"]
+        todo = [f for f in findings if applicable(f)]
+        if len(todo) < len(findings):
+            ui.info(f"{len(findings) - len(todo)} more finding(s) are report only; see: synk-tune audit")
+        if not todo:
+            ui.ok("Nothing to apply: no OPcache change is needed.")
+            return core.OK
+        by_ver = {}
+        for f in ui.review(todo):
+            ver, key = ID_RE.match(f.id).groups()
+            by_ver.setdefault(ver, {})[key] = f.proposed
+        if not by_ver:
+            ui.ok("Nothing selected, nothing changed.")
+            return core.OK
+        plan = []
+        for ver, chosen in by_ver.items():
+            path = dropin_path(ver)
+            vals = {k: v for k, v, _ in ini_entries(host, [path])} if host.exists(path) else {}
+            vals.update(chosen)  # keep what is already in the drop-in, our choices win
+            plan.append((ver, vals, change.Edit(host.p(path), render_dropin(vals), 0o644)))
+        ui.preview([e for _, _, e in plan])
+        if a.dry_run:
+            ui.info("[dry run] nothing was changed")
+            return core.OK
+        failures = []
+        for ver, vals, edit in plan:
+            try:
+                r = change.apply(ctx, [edit], validate=[f"php-fpm{ver}", "-t"], reload=["systemctl", "reload", f"php{ver}-fpm"],
+                                 verify=lambda ver=ver, vals=vals: verify_opcache(host, ver, vals), run=run)
+            except core.Fail as f:
+                ui.error(f"PHP {ver}: {f}")
+                failures.append(f"PHP {ver}: {f}")
+                continue
+            ui.ok(f"PHP {ver}: OPcache settings applied and php{ver}-fpm reloaded")
+            if r["stamp"]:
+                ui.info(f"Undo with: {ctx.root}/current/deployment/optimizer/synk-tune rollback --stamp {r['stamp']}")
+        if failures:
+            raise core.Fail("Not everything was applied (nothing is left half-changed): " + "; ".join(failures))
+    return core.OK
+
+
+def cmd_rollback(ctx, a, host, run):
+    need_root(host)
+    with core.lock(ctx):
+        stamp = a.stamp or change.latest(ctx)
+        if not stamp:
+            raise core.Fail(f"No backups to restore in {ctx.path('data', 'backups')}.")
+        manifest = core.read_json(os.path.join(ctx.path("data", "backups"), stamp, "manifest.json"), {}) if change.STAMP.match(stamp) else {}
+        vers = sorted({m[1] for e in (manifest or {}).get("entries", []) if (m := DROPIN_RE.search(e["path"]))})
+        change.restore(ctx, stamp, reload=[["systemctl", "reload", f"php{v}-fpm"] for v in vers], run=run)
+        ui.ok(f"Restored backup {stamp}" + (f" and reloaded php{', php'.join(vers)}-fpm" if vers else ""))
+    return core.OK
+
+
+# ---------------------------------------------------------------- status
+
+def build_status(ctx, host):
+    versions = [v for v, subs in sysinfo.php_versions(host.p("/etc/php")).items() if "fpm" in subs]
+    managed = [dropin_path(v) for v in versions if host.exists(dropin_path(v))]
+    saturated = {f"{v}/{pool}": n for v in versions for pool, n in saturation(host, v, 24).items()}
+    installed = bool(managed)
+    health = "degraded" if saturated else "healthy" if installed else "unknown"
+    warnings = [f"PHP-FPM pool {k} reached pm.max_children {n} time(s) in the last 24 hours" for k, n in sorted(saturated.items())]
+    summary = ("PHP-FPM ran out of workers in the last 24 hours" if saturated
+               else "OPcache tuning applied" if installed else "Nothing applied yet; run synk-tune audit to see recommendations")
+    return core.status_doc(MODULE, VERSION, "installed" if installed else "not_installed", health, summary,
+                           {"managed_files": managed, "saturated": saturated}, warnings, ["synk-tune"] if saturated else [])
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    p = core.Parser(prog="synk-tune", description="Audit server settings against RAM and CPUs; apply the OPcache drop-in.",
+                    epilog="exit codes: 0 ok, 2 failed (everything is restored), 64 usage or not root, 130 cancelled.")
+    core.common_args(p, json=False)
+    p.add_argument("--status-json", action="store_true", help="status JSON for softsynk-server (module contract; always exits 0)")
+    p.add_argument("--version", action="store_true")
+    sub = p.add_subparsers(dest="cmd", parser_class=core.Parser, metavar="COMMAND")
+    s = sub.add_parser("audit", help="report recommendations; changes nothing")
+    core.common_args(s, json=False)
+    s = sub.add_parser("rollback", help="undo an applied change from its backup")
+    core.common_args(s, json=False)
+    s.add_argument("--stamp", help="backup to restore (default: the newest)")
+    return p
+
+
+def main(argv=None, host=None, run=core.run):
+    p = build_parser()
+    a = core.parse_args(p, argv)
+    ui.setup(a)
+    if a.version:
+        print(f"synk-tune {VERSION}")
+        return core.OK
+    ctx, host = core.Ctx(MODULE, a.root), host or Host()
+
+    def go():
+        if a.status_json:
+            print(json.dumps(build_status(ctx, host), indent=2, sort_keys=True))
+            return core.OK
+        if a.cmd == "audit":
+            return cmd_audit(ctx, a, host, run)
+        if a.cmd == "rollback":
+            return cmd_rollback(ctx, a, host, run)
+        return cmd_tune(ctx, a, host, run)
+    return core.main(go, "synk-tune")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

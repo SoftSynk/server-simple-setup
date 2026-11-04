@@ -1,0 +1,29 @@
+schema = 1
+id = "optimizer"
+name = "Server tuning"
+description = "Compares PHP, PHP-FPM, Nginx, Apache, Redis and Meilisearch settings with the server's RAM and CPUs; applies only an OPcache drop-in"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "audit is read only: it reads /proc, /etc/php, /etc/nginx, /etc/apache2, /etc/redis, the PHP-FPM and Nginx logs and the application folders under /var/www and /home, and changes nothing",
+  "the only change it applies is /etc/php/<version>/fpm/conf.d/99-softsynk-opcache.ini, raising OPcache memory, interned strings and file slots to fit the PHP files found on the server",
+  "before and after that write it runs php-fpm<version> -t, then systemctl reload php<version>-fpm (no restart); any failure restores the old file and reloads again",
+  "keeps a backup of every changed file under the management root (data/optimizer/backups) so synk-tune rollback can undo it",
+  "PHP-FPM pools, Nginx, Apache, Redis, Meilisearch and php.ini findings are report only: it prints the exact change to make by hand",
+  "links /usr/local/bin/synk-tune when bootstrap.sh runs",
+]
+
+# Python 3.11+ (the shared lib needs it) is the only requirement; Ubuntu 24.04 ships 3.12.
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install   = ["synk-tune"]
+configure = ["synk-tune"]
+status    = ["synk-tune", "--status-json"]
+
+[commands]
+synk-tune = "synk-tune"

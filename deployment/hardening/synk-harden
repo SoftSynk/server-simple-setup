@@ -1,0 +1,902 @@
+#!/usr/bin/env python3
+"""synk-harden: harden SSH and the firewall without locking yourself out.
+Module "hardening" of softsynk-server-management. Python 3 standard library plus lib/softsynk.
+See README.md in this folder for the operator guide.
+
+The one rule that shapes everything: no change may be able to strand the operator. So
+  - turning passwords off (or touching root login) is refused unless the login log proves THIS session, still connected, came in with a key;
+  - every SSH port is allowed in ufw before ufw is enabled;
+  - before anything changes, a transient systemd timer is armed that puts the old files back after revert_minutes;
+    only `confirm`, run from a NEW SSH session, stops it;
+  - the sshd drop-in is checked with `sshd -t`, and `sshd -T` must show every intended value after the reload.
+Any failure after the timer is armed undoes everything; if even that fails, the timer stays armed.
+"""
+import contextlib
+import datetime as dt
+import glob
+import ipaddress
+import json
+import os
+import pwd
+import re
+import shlex
+import shutil
+import socket
+import sys
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "lib"))
+from softsynk import change, core, notify, sysinfo, ui  # noqa: E402
+
+MODULE, VERSION = "hardening", "1.0.0"
+BIN = "/usr/local/bin/synk-harden"
+UNIT_PREFIX = "softsynk-harden-revert-"
+DEFAULTS = {"revert_minutes": 10}
+RELOAD = ["systemctl", "try-reload-or-restart", "ssh.service"]
+HEADER = "# Managed by softsynk-server (synk-harden). Edits are overwritten; run synk-harden apply to change it.\n"
+LOOKBACK_DAYS = 7
+LOCK_WAIT = 120  # seconds the revert timer waits for a confirm or revert that holds the lock
+DB_PORTS = (3306, 5432, 6379, 6380, 7700, 11211, 9200, 27017)
+WEB_PORTS = (80, 443)
+PROOF = ("ssh_password", "ssh_rootlogin")  # findings that can end logins: they need the key-login proof
+ACCEPTED = re.compile(r"Accepted (\S+) for (\S+) from (\S+) port (\d+)")  # one line of `journalctl -o cat` for sshd
+PORT_RE = re.compile(r"([0-9]{1,5})(/(tcp|udp))?")
+
+
+# ---------------------------------------------------------------- what may be written
+
+def _enum(*ok):
+    return lambda v: None if v in ok else "must be " + " or ".join(ok)
+
+
+def _num(lo, hi):
+    return lambda v: None if re.fullmatch(r"[0-9]{1,4}", v) and lo <= int(v) <= hi else f"must be a whole number from {lo} to {hi}"
+
+
+# finding id -> (directives written, value check). The ASCII-only checks are the injection defence: a value is
+# one word of digits or a fixed keyword, so it can never carry a second directive.
+SETTINGS = {
+    "ssh_password": ([("PasswordAuthentication", "{}"), ("KbdInteractiveAuthentication", "{}")], _enum("no")),
+    "ssh_rootlogin": ([("PermitRootLogin", "{}")], _enum("prohibit-password", "no", "forced-commands-only")),
+    "ssh_emptypw": ([("PermitEmptyPasswords", "{}")], _enum("no")),
+    "ssh_maxauth": ([("MaxAuthTries", "{}")], _num(3, 10)),  # below 3 a client with a few keys cannot log in
+    "ssh_x11": ([("X11Forwarding", "{}")], _enum("no")),
+    "ssh_grace": ([("LoginGraceTime", "{}")], _num(10, 120)),
+    "ssh_alive": ([("ClientAliveInterval", "{}"), ("ClientAliveCountMax", "2")], _num(30, 3600)),
+}
+PRIMARY = {v[0][0][0].lower(): k for k, v in SETTINGS.items()}  # first directive of a setting -> its finding id
+OURS = {n.lower() for lines, _ in SETTINGS.values() for n, _ in lines}  # every directive name this tool writes
+
+
+def directives(values):
+    """[(Name, value)] in file order for {finding id: value}; Fail for an unknown id or a bad value."""
+    for k, v in values.items():
+        if k not in SETTINGS:
+            raise core.Fail(f"unknown setting '{k}'", core.USAGE)
+        problem = SETTINGS[k][1](v) if isinstance(v, str) else "must be text"
+        if problem:
+            raise core.Fail(f"{k}: {problem}", core.USAGE)
+    return [(n, t.format(values[k])) for k, (lines, _) in SETTINGS.items() if k in values for n, t in lines]
+
+
+def render_dropin(kept, new):
+    """The drop-in text: earlier choices (`kept`) overlaid with `new`, both {finding id: value}."""
+    return HEADER + "".join(f"{n} {v}\n" for n, v in directives({**kept, **new}))
+
+
+def read_dropin(path):
+    """Choices of an existing drop-in as {finding id: value}. Fail when it holds a line this tool did not write:
+    rewriting the file would silently delete that line (an AllowUsers or Match block, say)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return {}
+    out = {}
+    for line in text.splitlines():
+        p = line.split()
+        if not p or line.lstrip().startswith("#"):
+            continue
+        key = PRIMARY.get(p[0].lower())
+        # ponytail: a secondary directive (ClientAliveCountMax) is accepted with any value, it is rewritten from its setting
+        if len(p) == 2 and (p[0].lower() in OURS if key is None else not SETTINGS[key][1](p[1])):
+            if key:
+                out[key] = p[1]
+            continue
+        raise core.Fail(f"{path} has a line synk-harden did not write: '{line.strip()}'. Rewriting the file would delete it. "
+                        f"Move it to another file such as {os.path.dirname(path)}/20-local.conf or remove it, then run this again.")
+    return out
+
+
+def parse_ports(v):
+    """Extra ufw ports from "80/tcp, 443, 8080/udp" ("" or "none" = no extra port). ValueError names a bad item."""
+    items = [i.strip() for i in v.split(",")]
+    if items == [""] or items == ["none"]:
+        return []
+    for i in items:
+        m = PORT_RE.fullmatch(i)
+        if not m or not 1 <= int(m[1]) <= 65535:
+            raise ValueError(f"'{i}' is not a port like 443 or 443/tcp")
+    return list(dict.fromkeys(items))
+
+
+def check_ports(v):
+    try:
+        parse_ports(v)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def check_config(c):
+    return [] if 3 <= c["revert_minutes"] <= 60 else ["revert_minutes must be 3 to 60"]
+
+
+# ---------------------------------------------------------------- the machine
+
+@dataclass
+class Host:
+    """Everything that touches the machine, so tests can point it at a temp tree and script the commands."""
+    run: Callable
+    which: Callable
+    dropin: str
+    sshd_config: str
+    ufw_files: tuple
+    ancestry: Callable  # [environment dict of this process, its parent, ...]
+    home: Callable      # user name -> home directory or None
+    hostname: str
+    uid: int
+    send: Callable      # (root, subject, body) -> (ok, detail); mail is best effort
+
+
+def _home(user):
+    try:
+        return pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return None
+
+
+def default_host(ctx):
+    return Host(run=core.run, which=shutil.which, dropin="/etc/ssh/sshd_config.d/10-softsynk.conf", sshd_config="/etc/ssh/sshd_config",
+                ufw_files=("/etc/ufw/user.rules", "/etc/ufw/user6.rules", "/etc/ufw/ufw.conf", "/etc/default/ufw"),
+                ancestry=lambda: read_ancestry("/proc", os.getpid()), home=_home, hostname=socket.gethostname(),
+                uid=os.geteuid(), send=notify.send)
+
+
+def need_root(host):
+    if host.uid != 0:
+        raise core.Fail("synk-harden must run as root: it reads the SSH config and changes the firewall.")
+
+
+def first_line(text):
+    return (text.splitlines() or [""])[0][:200]
+
+
+# ---------------------------------------------------------------- who is logged in
+
+def read_ancestry(proc, pid):
+    """Environments of `pid` and its parents, nearest first. sudo drops SSH_CONNECTION from its child, the login
+    shell above it still has it."""
+    envs = []
+    for _ in range(64):
+        if pid <= 1:
+            break
+        base = os.path.join(proc, str(pid))
+        try:
+            with open(os.path.join(base, "environ"), "rb") as f:
+                raw = f.read()
+            with open(os.path.join(base, "status"), encoding="utf-8", errors="replace") as f:
+                status = f.read()
+        except OSError:
+            break
+        envs.append(dict(kv.split("=", 1) for kv in raw.decode("utf-8", "replace").split("\0") if "=" in kv))
+        m = re.search(r"^PPid:\s*(\d+)", status, re.M)
+        pid = int(m[1]) if m else 0
+    return envs
+
+
+def find_session(envs):
+    """{"ip", "port", "server_port"} from the first SSH_CONNECTION ("client_ip client_port server_ip server_port"), or None."""
+    for env in envs:
+        f = env.get("SSH_CONNECTION", "").split()
+        if len(f) == 4 and f[1].isascii() and f[3].isascii() and f[1].isdigit() and f[3].isdigit():
+            try:
+                ipaddress.ip_address(f[0])
+            except ValueError:
+                continue
+            if 0 < int(f[1]) < 65536 and 0 < int(f[3]) < 65536:
+                return {"ip": f[0], "port": int(f[1]), "server_port": int(f[3])}
+    return None
+
+
+def norm_ip(text):
+    """An ipaddress object for an address as `ss` prints it ([v6]%iface, ::ffff:v4 mapped), or ValueError."""
+    ip = ipaddress.ip_address(text.strip("[]").partition("%")[0])
+    return getattr(ip, "ipv4_mapped", None) or ip
+
+
+def endpoint(text):
+    """(ip, port) of an ss address like 192.0.2.1:22 or [2001:db8::1]:22, or None."""
+    addr, _, port = text.rpartition(":")
+    try:
+        return norm_ip(addr), int(port)
+    except ValueError:
+        return None
+
+
+def established(host, session):
+    """True when an ESTABLISHED socket joins the client ip:port of `session` to its server port. Fails closed."""
+    r = host.run(["ss", "-Htn", "state", "established"], timeout=20)
+    if not r.ok:
+        return False
+    want = (norm_ip(session["ip"]), session["port"])
+    for line in r.out.splitlines():
+        f = line.split()  # the last two fields are local and peer, whether or not a State column is there
+        if len(f) >= 2 and endpoint(f[-1]) == want and (endpoint(f[-2]) or (None, None))[1] == session["server_port"]:
+            return True
+    return False
+
+
+def session_of(host):
+    """This shell's SSH session, only while its connection is open: a shell kept in tmux or screen still carries the
+    SSH_CONNECTION of a login that closed long ago."""
+    s = find_session(host.ancestry())
+    return s if s and established(host, s) else None
+
+
+def same_client(login, session):
+    try:
+        return ipaddress.ip_address(login[2]) == ipaddress.ip_address(session["ip"]) and login[3] == session["port"]
+    except ValueError:
+        return False
+
+
+def logins(host, since):
+    """[(method, user, ip, port)] of accepted SSH logins since `since`, oldest first. Fail when the log cannot be read."""
+    # -g: a bot-hammered host logs millions of failures a week; only Accepted lines matter here.
+    r = host.run(["journalctl", "--no-pager", "-o", "cat", "-g", "^Accepted ", "-u", "ssh.service", "-u", "sshd.service",
+                  "--since=" + since.astimezone(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")], timeout=60)
+    if not r.ok:
+        raise core.Fail("cannot read the SSH login log (journalctl): " + first_line(r.why()))
+    return [(m[1], m[2], m[3], int(m[4])) for m in map(ACCEPTED.match, r.out.splitlines()) if m]
+
+
+# ---------------------------------------------------------------- inspect
+
+@dataclass
+class State:
+    sshd: dict      # lower-case sshd -T key -> [values]
+    ufw: object     # True active, False inactive, None unknown or not installed
+    ufw_text: str
+    listeners: list
+    ports: list     # every SSH port, ints
+    warnings: list
+
+
+def parse_sshd(text):
+    d = {}
+    for line in text.splitlines():
+        k, _, v = line.strip().partition(" ")
+        if k:
+            d.setdefault(k.lower(), []).append(v.strip())
+    return d
+
+
+def one(d, key, default=""):
+    return (d.get(key) or [default])[0]
+
+
+def num(d, key):
+    v = one(d, key)
+    return int(v) if re.fullmatch(r"[0-9]{1,9}", v) else None
+
+
+def public_ports(st):
+    return sorted({lis["port"] for lis in st.listeners if not lis["local"]})
+
+
+def inspect(host, session=None):
+    r = host.run(["sshd", "-T"], timeout=30)
+    if not r.ok:
+        raise core.Fail("cannot read the effective SSH config (sshd -T): " + first_line(r.why()))
+    sshd, warns = parse_sshd(r.out), []
+    lst = sysinfo.listeners(host.run)
+    ports = {int(p) for p in sshd.get("port", []) if re.fullmatch(r"[0-9]{1,5}", p) and 0 < int(p) < 65536}
+    ports |= {lis["port"] for lis in lst if "sshd" in lis["procs"]}  # socket activation can listen elsewhere than Port
+    if session:
+        ports.add(session["server_port"])
+    ufw, text = None, ""
+    if not host.which("ufw"):
+        warns.append("ufw is not installed: no firewall findings (install it with /usr/bin/apt-get install ufw to get them)")
+    else:
+        u = host.run(["ufw", "status", "verbose"], timeout=30)
+        if not u.ok:
+            warns.append("cannot read the firewall status (ufw status verbose): " + first_line(u.why()))
+        else:
+            text, ufw = u.out, "Status: active" in u.out
+    if ufw:
+        for p in sorted(ports):
+            ssh_rule = rf"^{p}(/tcp)?(\s+\(v6\))?\s+(ALLOW|LIMIT)" + (r"|^OpenSSH\s+(ALLOW|LIMIT)" if p == 22 else "")
+            if not re.search(ssh_rule, text, re.M):  # ponytail: app profiles other than OpenSSH are not recognised
+                warns.append(f"ufw is active but has no allow rule for SSH port {p}: new SSH connections may be blocked")
+    if ufw is not False:
+        for lis in lst:
+            if lis["port"] in DB_PORTS and not lis["local"]:
+                warns.append(f"port {lis['port']} ({'/'.join(lis['procs']) or 'database or cache'}) listens on a public address: "
+                             "make sure the firewall blocks it (/usr/sbin/ufw status verbose)")
+    files = [host.sshd_config] + sorted(glob.glob(os.path.join(os.path.dirname(host.dropin), "*.conf")))
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                if re.search(r"^\s*Match\s", f.read(), re.M | re.I):
+                    warns.append("the SSH config has Match blocks. sshd -T does not evaluate them, so a Match block can still "
+                                 "allow what is turned off here for some users or addresses")
+                    break
+        except OSError:
+            pass
+    return State(sshd, ufw, text, lst, sorted(ports), warns)
+
+
+def build_findings(st):
+    s, out = st.sshd, []
+
+    def add(id_, sev, title, current, proposed, benefit, risk, check=None):
+        out.append(ui.Finding(id_, sev, title, current, proposed, benefit, risk, check or SETTINGS[id_][1]))
+
+    pw, kbd = one(s, "passwordauthentication"), one(s, "kbdinteractiveauthentication")
+    if "yes" in (pw, kbd):
+        add("ssh_password", "crit", "Turn off SSH password logins (PasswordAuthentication)",
+            f"PasswordAuthentication {pw}, KbdInteractiveAuthentication {kbd}", "no",
+            "Bots try passwords on every public server all day; with passwords off only your SSH keys can log in.",
+            "Without a working key you are locked out and only the provider console gets you back in. This tool refuses "
+            "unless this very session logged in with a key; after the change you must test a NEW login.")
+    if one(s, "permitrootlogin") == "yes":
+        add("ssh_rootlogin", "warn", "Root login by key only (PermitRootLogin)", "PermitRootLogin yes", "prohibit-password",
+            "A guessed or leaked root password can no longer open a root session; root needs its key.",
+            "Scripts or people that log in as root with a password stop working. The value can be edited to 'no', which also "
+            "blocks root keys: not allowed while you are logged in as root.")
+    if one(s, "permitemptypasswords") == "yes":
+        add("ssh_emptypw", "crit", "Refuse blank passwords (PermitEmptyPasswords)", "PermitEmptyPasswords yes", "no",
+            "An account without a password can no longer log in over SSH.",
+            "An account that relies on a blank password stops logging in over SSH.")
+    n = num(s, "maxauthtries")
+    if n is not None and n > 4:
+        add("ssh_maxauth", "info", "Fewer tries per connection (MaxAuthTries)", f"MaxAuthTries {n}", "4",
+            "Each connection gets fewer guesses before it is dropped.",
+            "A client that offers many keys from an agent can be cut off before the right one is tried; "
+            "IdentitiesOnly in the client config fixes that.")
+    if one(s, "x11forwarding") == "yes":
+        add("ssh_x11", "info", "No X11 forwarding (X11Forwarding)", "X11Forwarding yes", "no",
+            "Closes a rarely used channel between a remote program and your local screen.",
+            "ssh -X and ssh -Y stop working; a server without desktop programs does not need them.")
+    n = num(s, "logingracetime")
+    if n is not None and (n == 0 or n > 30):
+        add("ssh_grace", "info", "Shorter login window (LoginGraceTime)", f"LoginGraceTime {n}" + (" (no limit)" if n == 0 else ""), "30",
+            "A connection that does not log in within 30 seconds is dropped instead of holding a slot.",
+            "A very slow network or DNS can make a login take longer than 30 seconds; 30 is generous for key logins.")
+    n = num(s, "clientaliveinterval")
+    if n is not None and (n == 0 or n > 300):
+        add("ssh_alive", "info", "Drop dead connections (ClientAliveInterval)",
+            f"ClientAliveInterval {n}" + (" (never checks)" if n == 0 else ""), "300",
+            "A silent client is probed every 5 minutes and dropped after 2 misses, freeing its slot.",
+            "A session that stays silent for 10 minutes is closed; use tmux or screen for long jobs.")
+    if st.ufw is False and st.ports:
+        web = [f"{p}/tcp" for p in public_ports(st) if p in WEB_PORTS and p not in st.ports]
+        others = [p for p in public_ports(st) if p not in st.ports and p not in WEB_PORTS]
+        add("ufw_enable", "crit", "Turn on the firewall, SSH always allowed (ufw)",
+            "ufw is inactive: every listening port is reachable. Listening publicly: " + (", ".join(
+                f"{lis['port']} ({'/'.join(lis['procs'])})" if lis["procs"] else str(lis["port"])
+                for lis in st.listeners if not lis["local"]) or "nothing"),
+            ", ".join(web) or "none",
+            f"Only SSH ({', '.join(f'{p}/tcp' for p in st.ports)}) and the ports listed here stay reachable from outside; "
+            "everything else incoming, databases and caches included, is denied.",
+            "Any public service that is not in the list stops being reachable from outside"
+            + (f" (listening now, not kept: {', '.join(map(str, others))}; edit the list to keep them)" if others else "")
+            + ". Ports that Docker publishes bypass ufw.", check_ports)
+    return out
+
+
+def show(f):
+    ui.section(f"{f.title} [{f.severity}]")
+    for label, text in (("Current", f.current), ("Proposed", f.proposed), ("Benefit", f.benefit), ("Risk", f.risk)):
+        ui.say(f"{label + ':':<10}{text}")
+
+
+# ---------------------------------------------------------------- the lockout guard
+
+def has_keys(host, eff, user):
+    if one(eff, "authorizedkeyscommand", "none") not in ("none", ""):
+        return True  # keys come from a command: they cannot be listed, but a key login just worked
+    home = host.home(user)
+    if not home:
+        return False
+    for pat in one(eff, "authorizedkeysfile", ".ssh/authorized_keys").split():
+        path = pat.replace("%%", "\0").replace("%h", home).replace("%u", user).replace("\0", "%")
+        try:
+            with open(path if os.path.isabs(path) else os.path.join(home, path), encoding="utf-8", errors="replace") as f:
+                if any(ln.strip() and not ln.lstrip().startswith("#") for ln in f):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def prove(host, eff, session):
+    """(user, None) when this very session logged in with a key and a key login will keep working, else (user or None, why not).
+    ponytail: a login by SSH certificate (TrustedUserCAKeys) has no authorized_keys line and is refused here, never allowed."""
+    if not session:
+        return None, ("no live SSH connection found: this shell is not inside an SSH session (the provider console?), or it is a "
+                      "tmux or screen session whose SSH connection has closed. Log in over SSH with your key (a new connection, "
+                      "not a reattached tmux) and run this again.")
+    try:
+        mine = [x for x in logins(host, core.now() - dt.timedelta(days=LOOKBACK_DAYS)) if same_client(x, session)]
+    except core.Fail as f:
+        return None, str(f)
+    if not mine:
+        return None, (f"no entry for this session in the SSH login log (client {session['ip']} port {session['port']}, last "
+                      f"{LOOKBACK_DAYS} days). Open a fresh SSH login with your key and run this again.")
+    method, user = mine[-1][0], mine[-1][1]
+    if method != "publickey":
+        return user, f"this session logged in with {method}, not with a key, so nothing proves that a key works. Log in with your key and run this again."
+    if one(eff, "pubkeyauthentication", "yes") != "yes":
+        return user, "PubkeyAuthentication is off: keys are not accepted, so turning passwords off would lock everyone out."
+    if one(eff, "authenticationmethods", "any") != "any":
+        return user, (f"AuthenticationMethods is set ({one(eff, 'authenticationmethods')}): softsynk cannot tell which logins "
+                      "would survive, so it will not touch password or root login settings.")
+    if not has_keys(host, eff, user):
+        return user, f"no keys found for {user} in its authorized keys file(s): after the change nobody could log in."
+    return user, None
+
+
+def spec_hits(spec, ports):
+    """True when a ufw port spec (22, 22/tcp, 20:30, 22,80/tcp, ssh) covers one of `ports`."""
+    spec = spec.lower()
+    for item in ("22" if spec in ("ssh", "openssh") else spec.partition("/")[0]).split(","):
+        lo, _, hi = item.partition(":")
+        if lo.isdigit() and (hi or lo).isdigit() and any(int(lo) <= p <= int(hi or lo) for p in ports):
+            return True
+    return False
+
+
+def blocks_ssh(rule, ports):
+    """True when a line of `ufw show added` is a deny or reject rule that can stop SSH: it covers an SSH port or
+    names no port at all (every port). ponytail: a udp-only, one-address or app rule is flagged too, over-strict
+    beats a lockout; outgoing and routed rules cannot stop incoming SSH and are ignored."""
+    if not rule.startswith("ufw "):
+        return False
+    try:
+        t = shlex.split(rule)
+    except ValueError:
+        return True  # cannot read it, so cannot call it safe
+    t = t[:t.index("comment")] if "comment" in t else t
+    if t[1:2] == ["route"] or "out" in t:
+        return False
+    for i, w in enumerate(t[1:], 1):
+        if w in ("allow", "limit"):
+            return False
+        if w in ("deny", "reject"):
+            rest = t[i + 1:]
+            break
+    else:
+        return False
+    if "to" in rest or "from" in rest:
+        dest = rest[rest.index("to") + 1:] if "to" in rest else []
+        for key in ("port", "app"):
+            if key in dest[:-1]:
+                return spec_hits(dest[dest.index(key) + 1], ports)
+        return True
+    left, skip = [], False
+    for w in rest:  # simple syntax: [in] [on IFACE] [PORT[/proto]]
+        if skip:
+            skip = False
+        elif w == "on":
+            skip = True
+        elif w not in ("in", "log", "log-all"):
+            left.append(w)
+    return not left or spec_hits(left[-1], ports)
+
+
+def firewall_problem(host, st, session):
+    """Why ufw must not be enabled now, or None. Rules added while ufw is off are hidden from `ufw status`
+    but all go live on enable, and ufw ignores IPv6 unless /etc/default/ufw says IPV6=yes."""
+    r = host.run(["ufw", "show", "added"], timeout=30)
+    if not r.ok:
+        return "cannot read the existing firewall rules (ufw show added): " + first_line(r.why())
+    for rule in map(str.strip, r.out.splitlines()):
+        if blocks_ssh(rule, st.ports):
+            return (f"the existing rule '{rule}' would block SSH or every port as soon as ufw is on. Remove it first "
+                    f"(/usr/sbin/ufw delete {rule[4:]}) and run this again.")
+    try:
+        with open(host.ufw_files[3], encoding="utf-8", errors="replace") as f:
+            v6 = re.findall(r'^\s*IPV6\s*=\s*"?(\w+)"?\s*(?:#.*)?$', f.read(), re.M)
+    except OSError:
+        v6 = []
+    if (v6[-1] if v6 else "no") != "yes" and (":" in (session or {}).get("ip", "") or any(
+            ":" in lis["addr"] for lis in st.listeners if not lis["local"] and lis["port"] in st.ports)):
+        return ("SSH is reachable over IPv6 but ufw ignores IPv6 (IPV6 is not yes in /etc/default/ufw), so the firewall would leave "
+                "IPv6 unfiltered. Set IPV6=yes in /etc/default/ufw and run this again.")
+    return None
+
+
+def guard(host, st, session, chosen):
+    """(findings that may go ahead, [(finding, why refused)])."""
+    user, why = prove(host, st.sshd, session) if any(f.id in PROOF for f in chosen) else (None, None)
+    ok, refused = [], []
+    for f in chosen:
+        problem = why if f.id in PROOF else None
+        if not problem and f.id == "ssh_rootlogin" and f.proposed in ("no", "forced-commands-only") and user == "root":
+            problem = (f"you are logged in as root: PermitRootLogin {f.proposed} would stop root logins, yours included. "
+                       "Log in as another user first.")
+        if not problem and f.id == "ufw_enable":
+            problem = firewall_problem(host, st, session)
+        (refused if problem else ok).append((f, problem) if problem else f)
+    return ok, refused
+
+
+# ---------------------------------------------------------------- state, timer, revert
+
+def pending_path(ctx):
+    return ctx.path("state", "pending.json")
+
+
+def load_pending(ctx):
+    p = core.read_json(pending_path(ctx))  # a corrupt file raises Corrupt (a Fail)
+    return p if isinstance(p, dict) and p.get("state") in ("pending", "confirmed", "reverted") else None
+
+
+def save_pending(ctx, p):
+    core.write_json(pending_path(ctx), p, 0o600)
+
+
+def stop_timer(host, unit):
+    return host.run(["systemctl", "stop", unit + ".timer"], timeout=30).ok
+
+
+def timer_active(host, unit):
+    return host.run(["systemctl", "is-active", unit + ".timer"], timeout=20).ok
+
+
+def mail(ctx, host, subject, body):
+    try:
+        host.send(ctx.root, subject, body)
+    except Exception:  # ponytail: mail is best effort, a broken mailer must never fail or undo a hardening step
+        pass
+
+
+def when(iso_text):
+    t = core.parse_iso(iso_text)
+    return t.strftime("%H:%M") if t else "the set time"
+
+
+def do_revert(ctx, host, p, why, notify_admin=True):
+    """Put the files and the firewall back and mark the change reverted. Raises Fail (state and timer untouched)
+    when that did not fully work: state and timer stay as they were, so a timer that has not fired yet tries again
+    and status shows an unconfirmed change whose timer is gone."""
+    problems = []
+    if p.get("ufw"):  # first: restoring the rule files under a running firewall would leave the two disagreeing
+        r = host.run(["ufw", "--force", "disable"], timeout=60)
+        if not r.ok:
+            problems.append("ufw --force disable: " + first_line(r.why()))
+    try:
+        change.restore(ctx, p["stamp"], reload=RELOAD if p.get("ssh") else (), run=host.run)
+    except core.Fail as f:
+        problems.append(str(f))
+    if problems:
+        raise core.Fail("could not put everything back: " + "; ".join(problems))
+    p.update(state="reverted", reverted_at=core.iso(core.now()), reason=why)
+    save_pending(ctx, p)
+    stop_timer(host, p["unit"])
+    core.log(ctx, "harden.reverted", stamp=p["stamp"], reason=why)
+    if notify_admin:
+        mail(ctx, host, f"Hardening reverted on {host.hostname}",
+             f"synk-harden put the previous SSH and firewall settings back on {host.hostname}: {why}.\n"
+             f"To try again: {BIN} apply\n")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_audit(ctx, host, a):
+    need_root(host)
+    st = inspect(host, session_of(host))
+    found = build_findings(st)
+    for w in st.warnings:
+        ui.warn(w)
+    if not found:
+        ui.ok("Nothing to harden: SSH and the firewall already match the recommendations.")
+        return core.OK
+    for f in found:
+        show(f)
+    ui.info(f"{len(found)} recommendation(s). Choose and apply them with: {BIN} apply")
+    return core.OK
+
+
+def has_include(host):
+    """False only when sshd_config is readable and has no Include line for sshd_config.d/*.conf."""
+    try:
+        with open(host.sshd_config, encoding="utf-8", errors="replace") as f:
+            return bool(re.search(r"^\s*Include\s[^#\n]*sshd_config\.d/\*", f.read(), re.M | re.I))
+    except OSError:
+        return True
+
+
+def verify_effective(host, want):
+    """None when `sshd -T` shows every wanted (Name, value); else what it shows instead."""
+    r = host.run(["sshd", "-T"], timeout=30)
+    if not r.ok:
+        return "sshd -T failed: " + first_line(r.why())
+    eff = parse_sshd(r.out)
+    for name, value in want:
+        got = ["prohibit-password" if x == "without-password" else x for x in eff.get(name.lower(), [])]
+        if value not in got:
+            why = (f"an earlier line in /etc/ssh/sshd_config or another file in /etc/ssh/sshd_config.d wins; look for {name} there"
+                   if has_include(host) else
+                   f"/etc/ssh/sshd_config has no Include line for /etc/ssh/sshd_config.d/*.conf, so sshd never reads "
+                   f"{os.path.basename(host.dropin)}. Add the line 'Include /etc/ssh/sshd_config.d/*.conf' at the top of "
+                   "/etc/ssh/sshd_config and run this again")
+            return f"sshd still reports {name} {got[0] if got else '(unset)'} instead of {value}: {why}"
+    return None
+
+
+def run_ufw(host, plan):
+    for argv in plan:
+        r = host.run(argv, timeout=60)
+        if not r.ok:
+            raise core.Fail(f"{' '.join(argv)} failed: {first_line(r.why())}")
+    if "Status: active" not in host.run(["ufw", "status", "verbose"], timeout=30).out:
+        raise core.Fail("ufw did not become active")
+
+
+def cmd_apply(ctx, host, a):
+    need_root(host)
+    if not ui.interactive():  # the hostname question and the new-login test need a person; there is no scripted way around them
+        raise core.Fail("apply needs a person at the keyboard: it asks you to type this server's hostname, and the change must be tested "
+                        f"from a new SSH login. Run it yourself in an SSH session. {BIN} audit shows what it would change.", core.USAGE)
+    cfg = core.load_config(ctx.config_path, DEFAULTS, check_config) or DEFAULTS
+    minutes = cfg["revert_minutes"]
+    with core.lock(ctx):
+        p = load_pending(ctx)
+        if p and p["state"] == "pending":
+            raise core.Fail(f"a hardening change from {when(p.get('applied_at'))} waits for confirmation: run {BIN} confirm in a NEW "
+                            f"SSH session, or {BIN} revert to undo it")
+        session = session_of(host)
+        st = inspect(host, session)
+        for w in st.warnings:
+            ui.warn(w)
+        found = build_findings(st)
+        if not found:
+            ui.ok("Nothing to harden: SSH and the firewall already match the recommendations.")
+            return core.OK
+        chosen = ui.review(found)
+        if not chosen:
+            ui.info("No changes were made.")
+            return core.OK
+        chosen, refused = guard(host, st, session, chosen)
+        for f, why in refused:
+            ui.error(f"{f.id} not applied: {why}")
+        rc = core.FAILED if refused else core.OK
+        if not chosen:
+            return rc
+        values = {f.id: f.proposed for f in chosen if f.id in SETTINGS}
+        ufw = next((f for f in chosen if f.id == "ufw_enable"), None)
+        edits, want, plan = [], [], []
+        if values:
+            kept = read_dropin(host.dropin)
+            edits = [change.Edit(host.dropin, render_dropin(kept, values), 0o644)]
+            want = directives({**kept, **values})
+        if ufw:
+            plan = ([["ufw", "allow", f"{p}/tcp"] for p in st.ports] + [["ufw", "allow", x] for x in parse_ports(ufw.proposed)]
+                    + [["ufw", "default", "deny", "incoming"], ["ufw", "default", "allow", "outgoing"], ["ufw", "--force", "enable"]])
+        ui.section("What will change")
+        ui.preview(edits)
+        if plan:
+            print("ufw commands, in this order:\n" + "\n".join("  " + " ".join(c) for c in plan))
+        if a.dry_run:
+            ui.info("Dry run: nothing was changed.")
+            return rc
+        if not ui.confirm_danger("harden", host.hostname,
+                                 f"This changes how you can log in and which ports are reachable, and a wrong step can lock you out of "
+                                 f"{host.hostname}. A revert timer ({minutes} minutes) undoes everything unless you confirm from a NEW SSH session."):
+            ui.info("No changes were made.")
+            return rc
+        return apply_now(ctx, host, chosen, session, edits, want, plan, minutes, bool(ufw)) or rc
+
+
+def apply_now(ctx, host, chosen, session, edits, want, plan, minutes, ufw):
+    stamp = change.backup(ctx, ([host.dropin] if edits else []) + (list(host.ufw_files) if ufw else []))
+    unit, now = UNIT_PREFIX + stamp, core.now()
+    revert_at = now + dt.timedelta(minutes=minutes)
+    backup_dir = ctx.path("data", "backups", stamp)
+    r = host.run(["systemd-run", "--unit", unit, f"--on-active={minutes * 60}s", "--timer-property=AccuracySec=1s",
+                  "--description=softsynk-harden: undo the unconfirmed change", core.exec_path(ctx, __file__), "revert", "--unit", unit,
+                  "--non-interactive", "--root", ctx.root], timeout=30)
+    if not r.ok:  # nothing is changed yet, and nothing may change without the way back
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise core.Fail(f"could not arm the revert timer (systemd-run: {first_line(r.why())}); nothing was changed.")
+    p = {"state": "pending", "stamp": stamp, "unit": unit, "minutes": minutes, "applied_at": core.iso(now), "revert_at": core.iso(revert_at),
+         "session": {"ip": session["ip"], "port": session["port"]} if session else None, "ssh": bool(edits), "ufw": ufw,
+         "applied": [f.id for f in chosen]}
+    try:
+        save_pending(ctx, p)
+    except OSError as e:
+        stop_timer(host, unit)
+        shutil.rmtree(backup_dir, ignore_errors=True)
+        raise core.Fail(f"cannot write {pending_path(ctx)}: {e}; nothing was changed.")
+    try:
+        if edits:
+            change.apply(ctx, edits, validate=["sshd", "-t"], reload=RELOAD, verify=lambda: verify_effective(host, want), run=host.run)
+        if plan:
+            run_ufw(host, plan)
+    except core.Fail as err:
+        ui.warn("A step failed: putting every change back.")
+        try:
+            do_revert(ctx, host, p, "a step failed while applying", notify_admin=False)
+        except core.Fail as rev:
+            raise core.Fail(f"{err} The automatic undo failed too ({rev}). The revert timer stays armed and restores the old settings at "
+                            f"{revert_at.strftime('%H:%M')}. If you are locked out, use the provider console and run {BIN} revert.", err.code)
+        raise core.Fail(f"{err} Everything was put back; nothing changed on the server.", err.code)
+    core.log(ctx, "harden.applied", stamp=stamp, applied=p["applied"], revert_at=p["revert_at"])
+    ui.ok("Applied. The change is live but NOT confirmed yet.")
+    ui.section("Test it now")
+    ui.say(f"It is undone automatically at {revert_at.strftime('%H:%M')} ({minutes} minutes) unless you confirm.")
+    ui.say("1. Keep THIS session open. Open a NEW SSH session (another terminal window) and log in the way you normally do.")
+    ui.say(f"2. In that NEW session run:  {BIN} confirm")
+    ui.say("If the new login fails, do nothing: the timer restores the previous settings. To undo at once, "
+           f"or if you are locked out, use the provider's web console and run:  {BIN} revert")
+    return core.OK
+
+
+def cmd_confirm(ctx, host, a):
+    need_root(host)
+    with core.lock(ctx):
+        p = load_pending(ctx)
+        if p is None:
+            raise core.Fail("nothing is waiting for confirmation.")
+        if p["state"] == "confirmed":
+            ui.ok("Already confirmed.")
+            return core.OK
+        if p["state"] == "reverted":
+            raise core.Fail(f"the change was already reverted at {when(p.get('reverted_at'))} ({p.get('reason')}); nothing to confirm. "
+                            f"Run {BIN} apply to try again.")
+        session = session_of(host)
+        old = p.get("session")
+        if session is None:  # confirming without proof that a new login works would cancel the only way back
+            raise core.Fail("no live SSH connection found for this shell (the provider console, or a tmux or screen session whose SSH login "
+                            f"has closed), so the new login cannot be checked. Open a NEW SSH session (a new terminal window) and run {BIN} "
+                            f"confirm there, or run {BIN} revert to undo the change.")
+        if old and (old["ip"], old["port"]) == (session["ip"], session["port"]):
+            raise core.Fail("this is the SAME SSH session that applied the change. Open a NEW SSH session (another terminal window), "
+                            f"log in there and run {BIN} confirm in it.")
+        since = core.parse_iso(p.get("applied_at")) or core.now() - dt.timedelta(minutes=p.get("minutes", 10))
+        if not any(same_client(x, session) for x in logins(host, since)):
+            raise core.Fail(f"no login of this session (client {session['ip']} port {session['port']}) in the SSH log since the change. "
+                            "Log in again from a NEW session and retry.")
+        p.update(state="confirmed", confirmed_at=core.iso(core.now()))
+        save_pending(ctx, p)  # recorded first: a timer that fires late then finds nothing to undo
+        if not stop_timer(host, p["unit"]):
+            ui.warn(f"could not stop {p['unit']}.timer; it will find nothing to undo, so the change stays.")
+        core.log(ctx, "harden.confirmed", stamp=p["stamp"])
+        ui.ok(f"Confirmed: the change stays. To undo it later: {BIN} revert")
+        return core.OK
+
+
+def hold_lock(stack, ctx, wait):
+    """Take the lock. The revert timer (wait > 0) retries once a second: it fires only once, so a confirm or revert that
+    holds the lock at that moment must not make it give up."""
+    for _ in range(wait):
+        try:
+            return stack.enter_context(core.lock(ctx))
+        except core.Busy:
+            time.sleep(1)
+    return stack.enter_context(core.lock(ctx))
+
+
+def cmd_revert(ctx, host, a):
+    need_root(host)
+    with contextlib.ExitStack() as stack:
+        hold_lock(stack, ctx, LOCK_WAIT if a.unit else 0)
+        p = load_pending(ctx)
+        if a.unit:  # the timer: only the change it was armed for, only while that change still waits
+            if not p or p["state"] != "pending" or p.get("unit") != a.unit:
+                ui.info(f"Nothing to undo for {a.unit}: that change is not waiting any more.")
+                return core.OK
+            do_revert(ctx, host, p, f"it was not confirmed within {p.get('minutes')} minutes")
+            ui.ok("Reverted: the previous SSH and firewall settings are back.")
+            return core.OK
+        if not p or p["state"] == "reverted":
+            ui.info("Nothing to revert.")
+            return core.OK
+        if p["state"] == "confirmed":  # ponytail: a confirmed change is undone by hand, an old backup would drop rules added since
+            raise core.Fail(f"the change was confirmed, so revert does not undo it. To undo it yourself: delete {host.dropin}, run "
+                            "/usr/bin/systemctl reload ssh.service, and review /usr/sbin/ufw status.")
+        do_revert(ctx, host, p, "reverted by the operator")
+        ui.ok("Reverted: the previous SSH and firewall settings are back.")
+        return core.OK
+
+
+# ---------------------------------------------------------------- status
+
+def status(ctx, host):
+    warns, actions = [], [BIN + " audit"]
+    try:
+        p, bad = load_pending(ctx), False
+    except core.Fail as f:
+        p, bad = None, True
+        warns.append(str(f))
+    st, n = None, None
+    try:
+        st = inspect(host)
+        warns += st.warnings
+        n = len(build_findings(st))
+    except core.Fail as f:
+        warns.append(str(f))
+    state = p["state"] if p else None
+    details = {"findings": n, "pending": {k: p.get(k) for k in ("state", "unit", "applied_at", "revert_at")} if p else None}
+    if st:
+        details["public_ports"] = public_ports(st)
+    if bad:
+        return core.status_doc(MODULE, VERSION, "unknown", "unknown", "the pending-change record is unreadable", details, warns, actions)
+    if state == "pending":
+        alive = timer_active(host, p["unit"])
+        warns.insert(0, f"a change waits for confirmation until {when(p['revert_at'])}: open a NEW SSH session and run {BIN} confirm"
+                     if alive else f"a change waits for confirmation but its revert timer is gone (a reboot loses it), so it will not "
+                                   f"undo itself: run {BIN} confirm or {BIN} revert")
+        return core.status_doc(MODULE, VERSION, "installed", "degraded" if alive else "unhealthy",
+                               "a hardening change waits for confirmation", details, warns, [BIN + " confirm", BIN + " revert"])
+    if state == "confirmed":
+        summary = ("hardening confirmed; " + f"{len(public_ports(st))} public port(s) open ({', '.join(map(str, public_ports(st)))})"
+                   if st else "hardening confirmed; cannot read the current settings")
+        return core.status_doc(MODULE, VERSION, "installed", "healthy", summary, details, warns, actions)
+    if state == "reverted":
+        warns.insert(0, f"the last change was reverted at {when(p.get('reverted_at'))} ({p.get('reason')})")
+    summary = f"not applied; {n} recommendation(s)" if n is not None else "cannot read the current SSH and firewall settings"
+    return core.status_doc(MODULE, VERSION, "not_installed", "unknown", summary, details, warns, [BIN + " apply"])
+
+
+# ---------------------------------------------------------------- entry
+
+def build_parser():
+    p = core.Parser(prog="synk-harden", description="Harden SSH and the firewall without locking yourself out.",
+                    epilog="exit codes: 0 ok, 2 something failed or was refused, 64 usage or config error, 130 cancelled. "
+                           "--status-json always exits 0.")
+    core.common_args(p)
+    p.add_argument("--status-json", action="store_true", help="status JSON for softsynk-server (module contract; always exits 0)")
+    sub = p.add_subparsers(dest="cmd", parser_class=core.Parser, metavar="COMMAND")
+    for name, help_ in (("audit", "show what could be hardened, with benefit and risk (read-only)"),
+                        ("apply", "choose, preview, confirm and apply; arms the revert timer"),
+                        ("confirm", "keep the change: run it from a NEW SSH session; stops the revert timer"),
+                        ("revert", "undo the last change now")):
+        s = sub.add_parser(name, help=help_)
+        core.common_args(s)
+        if name == "revert":
+            s.add_argument("--unit", help="used by the revert timer: undo only if this change is still waiting")
+    return p
+
+
+def _main(argv, host):
+    p = build_parser()
+    a = core.parse_args(p, argv)
+    ui.setup(a)
+    ctx = core.Ctx(MODULE, a.root)
+    host = host or default_host(ctx)
+    if a.status_json:
+        try:
+            doc = status(ctx, host)
+        except Exception as e:  # the contract: --status-json always answers and exits 0
+            doc = core.status_doc(MODULE, VERSION, "unknown", "unknown", f"status failed: {e}")
+        print(json.dumps(doc))
+        return core.OK
+    if not a.cmd:
+        p.print_help(sys.stderr)
+        return core.USAGE
+    return {"audit": cmd_audit, "apply": cmd_apply, "confirm": cmd_confirm, "revert": cmd_revert}[a.cmd](ctx, host, a)
+
+
+def main(argv=None, host=None):
+    return core.main(lambda: _main(argv, host), prog="synk-harden")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

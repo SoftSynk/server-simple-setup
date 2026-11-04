@@ -82,11 +82,11 @@ sudo ./setup-auto-updates.sh --dry-run   # ask everything, show the diff, change
 | `--accept-defaults` | Takes each question's default (the previous answer on a rerun) when it has no pre-supplied answer. Only applies when the run is non-interactive: `--non-interactive`, or no terminal. |
 | `--root DIR` | Management root for the log and lock (default `$SOFTSYNK_ROOT`, else `/opt/softsynk-server-management`). Must be an absolute path. |
 
-An unknown option exits 64. The same switches can come from the environment (`SOFTSYNK_NONINTERACTIVE=1`, `SOFTSYNK_ACCEPT_DEFAULTS=1`, `SOFTSYNK_DRY_RUN=1`, `SOFTSYNK_ROOT`), which is how softsynk-server passes them.
+An unknown option exits 64. The same switches can come from the environment (`SOFTSYNK_NONINTERACTIVE=1`, `SOFTSYNK_ACCEPT_DEFAULTS=1`, `SOFTSYNK_DRY_RUN=1`, `SOFTSYNK_ROOT`), which is how Synk Server Manager passes them.
 
 **Pre-supplied answers.** Two free-text questions can be answered ahead of time in the environment: `SOFTSYNK_ANSWER_REBOOT=03:30` (the reboot time; asked only when automatic reboot is chosen) and `SOFTSYNK_ANSWER_MAIL=ops@example.com` (`-` for none). The choice and yes/no questions have no stable names, so use `--accept-defaults` for them. Confirmations such as "Write these settings?" follow their default, which is No when the script would replace a file it did not write or drop a saved choice.
 
-On a server, let softsynk-server run it:
+On a server, let Synk Server Manager run it:
 
 ```bash
 sudo softsynk-server install auto-updates
@@ -199,7 +199,7 @@ Result:          SUCCESS
 
 ## Module status (`--status-json`)
 
-`./setup-auto-updates.sh --status-json` prints one JSON line in the softsynk-server status format (schema 1) and exits 0 whatever it finds. It reads only: the managed file, `dpkg-query`, `apt-config dump` (the effective config), `systemctl is-active/is-enabled/show` for the two timers, the needrestart config and `/var/run/reboot-required`. It takes no lock, writes nothing and never runs `unattended-upgrade` or apt, so it is safe at any time, including during the 06:00 upgrade window and without root.
+`./setup-auto-updates.sh --status-json` prints one JSON line in the Synk Server Manager status format (schema 1) and exits 0 whatever it finds. It reads only: the managed file, `dpkg-query`, `apt-config dump` (the effective config), `systemctl is-active/is-enabled/show` for the two timers, the needrestart config and `/var/run/reboot-required`. It takes no lock, writes nothing and never runs `unattended-upgrade` or apt, so it is safe at any time, including during the 06:00 upgrade window and without root.
 
 | Field | Meaning |
 |---|---|
@@ -283,7 +283,7 @@ The script has no host-specific values. It finds third-party repos on each serve
   - unattended-upgrades never reboots or sends mail in a dry run.
   - The dry run doesn't stop that day's scheduled run from happening.
   - The three lock messages the script looks for exist in the installed version.
-- Checked locally: `bash -n`, ShellCheck (no findings), `tests/deployment/test_status.py` (`--status-json` against stubbed `systemctl`, `dpkg-query` and `apt-config`: not installed, adopted, healthy, daily upgrades off, overridden reboot setting, pending reboot, inactive timer, silent systemd, unreadable apt config; plus a check that softsynk-server accepts the output) and `--self-test`, which also passes on Bash 5.3. The self-test covers time and email validation, repo detection from real `apt-cache policy` output (including a repo without a release line, and host names that would be unsafe in the config), needrestart mode parsing, the read-back of choices and the generated file for both the full and the minimal choice sets.
+- Checked locally: `bash -n`, ShellCheck (no findings), `tests/deployment/test_status.py` (`--status-json` against stubbed `systemctl`, `dpkg-query` and `apt-config`: not installed, adopted, healthy, daily upgrades off, overridden reboot setting, pending reboot, inactive timer, silent systemd, unreadable apt config; plus a check that Synk Server Manager accepts the output) and `--self-test`, which also passes on Bash 5.3. The self-test covers time and email validation, repo detection from real `apt-cache policy` output (including a repo without a release line, and host names that would be unsafe in the config), needrestart mode parsing, the read-back of choices and the generated file for both the full and the minimal choice sets.
 - Checked on the target server (read-only, as a non-root user): apt accepts the generated file (`apt-config -c`), and the merged values come out as expected. The installed unattended-upgrades supports `site=` patterns and logs them in the allowed-origins line.
 - The interactive run as root is the first end-to-end test. Use `--dry-run` first if you want to see the diff before anything is written.
 - The script doesn't change the upgrade time, set package blacklists, or configure outgoing mail. Change these by hand if you need them.

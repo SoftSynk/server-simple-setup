@@ -1,0 +1,10 @@
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+23 22 0:21 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+24 22 0:5 / /dev rw,nosuid,relatime shared:3 - devtmpfs udev rw,size=4000k
+25 22 0:22 / /run rw,nosuid,nodev shared:5 - tmpfs tmpfs rw,size=800000k,mode=755
+26 22 0:30 / /var/lib/docker/overlay2/abc/merged rw,relatime - overlay overlay rw,lowerdir=/x
+27 22 8:1 /var/www /srv/www-bind rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+28 22 8:16 / /mnt/data\040disk rw,relatime shared:9 - xfs /dev/sdb rw
+29 22 8:2 / /boot/efi rw,relatime shared:10 - vfat /dev/sda15 rw
+30 22 0:40 / /snap/core/1 ro,nodev,relatime - squashfs /dev/loop0 ro
+31 22 0:41 / /proc/sys/fs/binfmt_misc rw - autofs systemd-1 rw

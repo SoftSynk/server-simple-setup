@@ -225,6 +225,25 @@ class Redaction(Scratch):
         self.assertNotIn(self.SECRET, json.dumps(state))
 
 
+class MailToDeprecated(Scratch):
+    def warnings(self, mail_to):
+        out = []
+        ok = mock.Mock(ok=True, out="170000", rc=0)
+        version = lambda ctx, tool, runas=False: "restic 0.17.1" if tool == "restic" else "pg 17.0"  # noqa: E731
+        with mock.patch.multiple(sb, tool_version=version, psql=lambda *a, **k: ok, discover=lambda ctx: [],
+                                 restic=lambda *a, **k: mock.Mock(rc=0)):
+            sb.validate_all(self.ctx, dict(self.ctx.cfg, mail_to=mail_to), lambda lvl, name, msg: out.append((lvl, name, msg)))
+        return [(n, m) for lvl, n, m in out if lvl == "warn"]
+
+    def test_set_mail_to_warns_and_points_at_notify(self):
+        (name, msg), = self.warnings("ops@example.com")
+        self.assertEqual(name, "mail")
+        self.assertIn("synk-notify", msg)
+
+    def test_empty_mail_to_is_silent(self):
+        self.assertEqual(self.warnings(""), [])
+
+
 class RestoreToFile(Scratch):
     def args(self, dest):
         return argparse.Namespace(db="app", globals=False, to_db=None, to_file=dest, replace_existing=False,

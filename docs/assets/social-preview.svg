@@ -2,7 +2,7 @@
   <rect width="1280" height="640" fill="#0f172a"/>
   <rect x="64" y="64" width="1152" height="512" rx="24" fill="#111c33" stroke="#1e293b" stroke-width="2"/>
   <circle cx="112" cy="112" r="9" fill="#ef4444"/><circle cx="142" cy="112" r="9" fill="#f59e0b"/><circle cx="172" cy="112" r="9" fill="#22c55e"/>
-  <text x="112" y="230" font-family="Menlo, Consolas, monospace" font-size="72" font-weight="700" fill="#f8fafc">softsynk-server</text>
+  <text x="112" y="230" font-family="Menlo, Consolas, monospace" font-size="72" font-weight="700" fill="#f8fafc">Synk Server Manager</text>
   <text x="112" y="298" font-family="Helvetica, Arial, sans-serif" font-size="34" fill="#cbd5e1">Encrypted PostgreSQL backups, Redis and automatic</text>
   <text x="112" y="344" font-family="Helvetica, Arial, sans-serif" font-size="34" fill="#cbd5e1">security updates for Ubuntu, managed by one command.</text>
   <g font-family="Menlo, Consolas, monospace" font-size="26">

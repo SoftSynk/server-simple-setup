@@ -1,0 +1,637 @@
+#!/usr/bin/env python3
+"""synk-clean: find what is eating the disk, preview what can safely go, delete it after a yes.
+Module "housekeeping" of softsynk-server-management. Python 3 standard library plus lib/softsynk.
+See README.md in this folder for the operator guide.
+
+Files are removed by exactly one function, sweep(): os.fwalk without following symlinks, regular files
+only, the same filesystem as the root, never inside a protected path, re-checked right before os.unlink
+through the directory's file descriptor. The estimate shown in the preview is the same walk without the unlink.
+"""
+import contextlib
+import copy
+import datetime as dt
+import fnmatch
+import glob
+import grp
+import json
+import os
+import pwd
+import re
+import shutil
+import stat
+import sys
+import time
+from dataclasses import dataclass
+from typing import Callable
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "..", "lib"))
+from softsynk import change, core, sysinfo, ui  # noqa: E402
+
+MODULE, VERSION = "housekeeping", "1.0.0"
+IDS = ("apt", "journal", "rotated", "laravel", "crash", "caches")
+DEFAULTS = {"keep_days": 30, "crash_keep_days": 7, "journal_max": "500M", "laravel_rotate_days": 14,
+            "large_file_mb": 100, "app_roots": ["/home/*/*", "/var/www/*"]}
+SIZE_RE = re.compile(r"^[1-9]\d*[KMGT]?$")
+UNITS = {"": 1, "B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+ROTATED = ("*.log.[0-9]", "*.log.[0-9].gz", "*.[0-9].gz", "*.old")  # anchored: never a live log, never "syslog.1"
+SAFE_PATH = re.compile(r"^[A-Za-z0-9_./@+-]+$")
+SAFE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*\$?$")
+OLD_BACKUP_DAYS = 90
+PROTECTED = ("/etc", "/boot", "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32",
+             "/var/lib/mysql", "/var/lib/postgresql", "/var/lib/redis", "/var/lib/meilisearch",
+             "/var/log/mysql", "/var/log/journal")
+HEADER = "# Managed by softsynk-server (synk-clean setup). Edits are overwritten; run setup again to change it.\n"
+
+
+# ---------------------------------------------------------------- config, protected paths, host
+
+def check_config(c):
+    p = []
+    if c["keep_days"] < 28:
+        p.append("keep_days must be at least 28 (Ubuntu keeps 4 weekly rotations; we never cut below that)")
+    if c["crash_keep_days"] < 1:
+        p.append("crash_keep_days must be at least 1")
+    if not SIZE_RE.match(c["journal_max"]):
+        p.append("journal_max must be a number with an optional K, M, G or T, like 500M")
+    if c["laravel_rotate_days"] < 1:
+        p.append("laravel_rotate_days must be at least 1")
+    if c["large_file_mb"] < 1:
+        p.append("large_file_mb must be at least 1")
+    if not all(isinstance(r, str) and os.path.isabs(r) for r in c["app_roots"]):
+        p.append("app_roots must be absolute paths or globs")
+    return p
+
+
+def load_cfg(ctx):
+    return core.load_config(ctx.config_path, DEFAULTS, check_config) or copy.deepcopy(DEFAULTS)
+
+
+def protected_paths(ctx):
+    """Never walked, never deleted from: system trees, database data, and our own etc/data/secrets/state."""
+    raw = PROTECTED + tuple(os.path.join(ctx.root, k) for k in ("etc", "data", "secrets", "state"))
+    return tuple(dict.fromkeys(raw + tuple(os.path.realpath(p) for p in raw)))
+
+
+def is_protected(path, protected):
+    return any(path == p or path.startswith(p.rstrip("/") + "/") for p in protected)
+
+
+@dataclass
+class Host:
+    """Everything that touches the machine, so tests can point it at a temp tree and script the commands."""
+    var_log: str
+    apt_archives: str
+    crash_dirs: tuple
+    cache_globs: tuple
+    protected: tuple
+    journald_conf: str
+    logrotate_conf: str
+    run: Callable
+    mounts: Callable
+    which: Callable
+    budget_s: float
+
+
+def default_host(ctx):
+    return Host(var_log="/var/log", apt_archives="/var/cache/apt/archives",
+                crash_dirs=("/var/crash", "/var/lib/systemd/coredump"),
+                cache_globs=("/root/.composer/cache", "/root/.cache/composer", "/root/.npm/_cacache",
+                             "/home/*/.composer/cache", "/home/*/.cache/composer", "/home/*/.npm/_cacache"),
+                protected=protected_paths(ctx), journald_conf="/etc/systemd/journald.conf.d/50-softsynk.conf",
+                logrotate_conf="/etc/logrotate.d/softsynk-laravel", run=core.run, mounts=sysinfo.mounts,
+                which=shutil.which, budget_s=5)
+
+
+# ---------------------------------------------------------------- rules
+
+def parse_size(s):
+    """'500M' or '1.0G' -> bytes; None when it is not a size."""
+    m = re.fullmatch(r"([\d.]+)\s*([BKMGT]?)", s.strip())
+    try:
+        return int(float(m[1]) * UNITS[m[2]]) if m else None
+    except ValueError:
+        return None
+
+
+def rotated_match(name):
+    return any(fnmatch.fnmatchcase(name, g) for g in ROTATED)
+
+
+def laravel_match(name):
+    return bool(re.fullmatch(r"laravel-\d{4}-\d{2}-\d{2}\.log", name)) or fnmatch.fnmatchcase(name, "laravel*.gz")
+
+
+# ---------------------------------------------------------------- the one deleting function
+
+def sweep(root, match, cutoff, protected, delete=False):
+    """Walk `root` and (delete=True) remove the old files whose name `match`es (None: any name); delete=False only counts them.
+    cutoff is a timestamp (None: no age limit). Returns {"files", "bytes", "skipped", "errors"}.
+
+    Safety: symlinks (root, directories, files) are never followed or removed; only regular files on the root's
+    filesystem; protected paths are pruned; each file is lstat'ed again right before the unlink, which goes
+    through the open directory descriptor so a directory swapped for a symlink mid-walk is not followed.
+    ponytail: intermediate components of `root` are resolved once by realpath; a user-writable parent could
+    be swapped in that instant. Matches are limited to rotated and Laravel log names, so the reach is small."""
+    out = {"files": 0, "bytes": 0, "skipped": 0, "errors": []}
+    if os.path.islink(root) or not os.path.isdir(root):
+        return out
+    real = os.path.realpath(root)
+    if is_protected(real, protected):
+        out["errors"].append(f"{root}: protected path, not touched")
+        return out
+    try:
+        rdev = os.lstat(real).st_dev
+    except OSError as e:
+        out["errors"].append(f"{root}: {e.strerror}")
+        return out
+    for dirpath, dirnames, filenames, dfd in os.fwalk(real, follow_symlinks=False):
+        keep = []
+        for d in dirnames:
+            try:
+                st = os.lstat(d, dir_fd=dfd)
+            except OSError:
+                continue
+            if stat.S_ISDIR(st.st_mode) and st.st_dev == rdev and not is_protected(os.path.join(dirpath, d), protected):
+                keep.append(d)
+        dirnames[:] = keep
+        for name in filenames:
+            if match and not match(name):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                st = os.lstat(name, dir_fd=dfd)
+            except OSError:
+                continue
+            if is_protected(full, protected) or not stat.S_ISREG(st.st_mode) or st.st_dev != rdev:
+                out["skipped"] += 1
+                continue
+            if cutoff is not None and not st.st_mtime < cutoff:
+                continue
+            if delete:
+                try:
+                    again = os.lstat(name, dir_fd=dfd)
+                    if not stat.S_ISREG(again.st_mode) or (again.st_ino, again.st_dev, again.st_mtime_ns, again.st_size) != \
+                            (st.st_ino, st.st_dev, st.st_mtime_ns, st.st_size):
+                        out["skipped"] += 1
+                        continue
+                    os.unlink(name, dir_fd=dfd)
+                except OSError as e:
+                    out["errors"].append(f"{full}: {e.strerror}")
+                    continue
+            out["files"] += 1
+            out["bytes"] += st.st_size
+    return out
+
+
+def _sum(results):
+    return {"files": sum(r["files"] for r in results), "bytes": sum(r["bytes"] for r in results),
+            "skipped": sum(r["skipped"] for r in results), "errors": [e for r in results for e in r["errors"]]}
+
+
+# ---------------------------------------------------------------- categories
+
+@dataclass
+class Plan:
+    id: str
+    title: str
+    what: str
+    files: int
+    bytes: int
+    default: bool
+    note: str
+    do: Callable  # () -> {"files", "bytes", "errors": [text]}
+
+
+@dataclass
+class App:
+    path: str
+    logs: str
+    user: str
+    group: str
+
+
+def _id_name(fn, n):
+    try:
+        return fn(n)[0]
+    except KeyError:
+        return str(n)
+
+
+def find_apps(host, cfg):
+    """Laravel apps under app_roots: a real directory with a regular `artisan` file and storage/logs that stays
+    inside the app. Returns (apps, notes); a symlinked storage (Forge zero-downtime, Envoyer) is skipped with a note."""
+    apps, notes, seen = [], [], set()
+    for pattern in cfg["app_roots"]:
+        for p in sorted(glob.glob(pattern)):
+            art = os.path.join(p, "artisan")
+            if os.path.islink(p) or not os.path.isdir(p) or os.path.islink(art) or not os.path.isfile(art):
+                continue
+            real = os.path.realpath(p)
+            logs = os.path.realpath(os.path.join(p, "storage", "logs"))
+            if real in seen or not os.path.isdir(logs):
+                continue
+            seen.add(real)
+            if not logs.startswith(real + "/"):
+                notes.append(f"{p}: storage/logs is outside the app (symlinked storage), skipped")
+                continue
+            st = os.stat(logs)
+            apps.append(App(p, logs, _id_name(pwd.getpwuid, st.st_uid), _id_name(grp.getgrgid, st.st_gid)))
+    return apps, notes
+
+
+def safe_app(app):
+    return bool(SAFE_PATH.match(app.logs) and SAFE_NAME.match(app.user) and SAFE_NAME.match(app.group))
+
+
+def sweep_plan(host, pid, title, what, jobs, default=True, notes=()):
+    """jobs: [(root, match, cutoff)]. The preview counts with the same sweep() that later deletes."""
+    est = _sum([sweep(r, m, c, host.protected) for r, m, c in jobs])
+    note = "; ".join([*notes, *est["errors"][:3]])
+    return Plan(pid, title, what, est["files"], est["bytes"], default, note,
+                lambda: _sum([sweep(r, m, c, host.protected, True) for r, m, c in jobs]))
+
+
+def apt_plan(host):
+    files = size = 0
+    with contextlib.suppress(OSError), os.scandir(host.apt_archives) as it:
+        for e in it:
+            if e.name.endswith(".deb") and e.is_file(follow_symlinks=False):
+                files, size = files + 1, size + e.stat(follow_symlinks=False).st_size
+
+    def do():
+        r = host.run(["apt-get", "clean"], timeout=120)
+        return {"files": files, "bytes": size, "errors": [] if r.ok else [f"apt-get clean: {r.why()}"]}
+    return Plan("apt", "Apt package cache", "Downloaded .deb files in /var/cache/apt/archives (apt-get clean)",
+                files, size, True, "", do)
+
+
+def journal_plan(host, cfg):
+    cap, est, note = cfg["journal_max"], 0, ""
+    r = host.run(["journalctl", "--disk-usage"], timeout=30)
+    if r.rc == 127:
+        note = "journalctl is not available"
+    elif not r.ok:
+        note = f"journalctl --disk-usage failed: {(r.why().splitlines() or [''])[0]}"
+    else:
+        m = re.search(r"take up ([\d.]+)\s*([BKMGT]?)", r.out)
+        usage = parse_size(m[1] + m[2]) if m else None
+        if usage is None:
+            note = "could not read the journal size"
+        else:
+            est = max(0, usage - parse_size(cap))
+
+    def do():
+        v = host.run(["journalctl", f"--vacuum-size={cap}"], timeout=120)
+        return {"files": 0, "bytes": est, "errors": [] if v.ok else [f"journalctl --vacuum-size: {v.why()}"]}
+    return Plan("journal", "Journal over the cap", f"systemd journal above {cap} (journalctl --vacuum-size)",
+                0, est, True, note, do)
+
+
+def build_plans(host, cfg, ctx, t=None):
+    """The six categories in a fixed order, each with its estimate and a do() that performs it."""
+    now = (t or core.now()).timestamp()
+    cut = lambda days: now - days * 86400  # noqa: E731
+    apps, notes = find_apps(host, cfg)
+    caches = [d for pat in host.cache_globs for d in sorted(glob.glob(pat))]
+    return [
+        apt_plan(host),
+        journal_plan(host, cfg),
+        sweep_plan(host, "rotated", "Rotated logs", f"Rotated logs in {host.var_log} older than {cfg['keep_days']} days",
+                   [(host.var_log, rotated_match, cut(cfg["keep_days"]))]),
+        sweep_plan(host, "laravel", "Laravel logs", f"Laravel logs older than {cfg['keep_days']} days ({len(apps)} apps)",
+                   [(a.logs, laravel_match, cut(cfg["keep_days"])) for a in apps], notes=notes),
+        sweep_plan(host, "crash", "Crash dumps", f"Crash reports and core dumps older than {cfg['crash_keep_days']} days",
+                   [(d, None, cut(cfg["crash_keep_days"])) for d in host.crash_dirs]),
+        sweep_plan(host, "caches", "Composer and npm caches", "Package caches, downloaded again when needed (not selected by default)",
+                   [(d, None, None) for d in caches], default=False),
+    ]
+
+
+# ---------------------------------------------------------------- report-only findings
+
+def _old_backups(ctx, t):
+    limit, n = t.replace(tzinfo=None) - dt.timedelta(days=OLD_BACKUP_DAYS), 0
+    for d in glob.glob(os.path.join(glob.escape(ctx.root), "data", "*", "backups", "*")):
+        if change.STAMP.match(os.path.basename(d)) and os.path.isdir(d) and not os.path.islink(d):
+            with contextlib.suppress(ValueError):
+                n += dt.datetime.strptime(os.path.basename(d)[:15], "%Y%m%d-%H%M%S") < limit
+    return n
+
+
+def report_only(host, cfg, ctx, t=None):
+    """What we only report, never delete: old softsynk releases, apt autoremove, docker and snap, old change backups."""
+    keep = {os.path.realpath(os.path.join(ctx.root, n)) for n in ("current", "previous")}
+    old = []
+    for d in sorted(glob.glob(os.path.join(glob.escape(ctx.root), "releases", "*"))):
+        if os.path.isdir(d) and not os.path.islink(d) and os.path.realpath(d) not in keep:
+            old.append({"name": os.path.basename(d), "path": d, "bytes": sysinfo.dir_sizes(d, top=1, budget_s=2)["total"]})
+    r = host.run(["apt-get", "-s", "autoremove"], timeout=60)
+    auto = sum(1 for line in r.out.splitlines() if line.startswith("Remv ")) if r.ok else None
+    return {"old_releases": old, "autoremove": auto, "docker": bool(host.which("docker")), "snap": bool(host.which("snap")),
+            "old_backups": _old_backups(ctx, t or core.now())}
+
+
+def large_files(host, cfg, top=10):
+    """Regular files of at least large_file_mb (allocated size), same device, no symlinks, within the time budget."""
+    limit, deadline = cfg["large_file_mb"] * 1024 ** 2, time.monotonic() + host.budget_s
+    found, complete = [], True
+    for m in host.mounts():
+        try:
+            dev = os.lstat(m["mount"]).st_dev
+        except OSError:
+            continue
+        stack = [m["mount"]]
+        while stack and complete:
+            if time.monotonic() > deadline:
+                complete = False
+                break
+            try:
+                it = os.scandir(stack.pop())
+            except OSError:
+                continue
+            with it:
+                for e in it:
+                    try:
+                        st = e.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_dev != dev:
+                        continue
+                    if stat.S_ISDIR(st.st_mode):
+                        stack.append(e.path)
+                    elif stat.S_ISREG(st.st_mode) and st.st_blocks * 512 >= limit:
+                        found.append({"path": e.path, "bytes": st.st_blocks * 512})
+    found.sort(key=lambda f: f["bytes"], reverse=True)
+    return found[:top], complete
+
+
+# ---------------------------------------------------------------- scan
+
+def mount_usage(host):
+    return [u for u in (sysinfo.fs_usage(m["mount"]) for m in host.mounts()) if u]
+
+
+def show_plans(plans, to_stderr=False):
+    ui.table([[p.id, p.title, p.files or "-", core.human(p.bytes) if p.bytes else "-", "yes" if p.default else "no"] for p in plans],
+             ["ID", "Category", "Files", "Recoverable", "Default"], file=sys.stderr if to_stderr else None)
+    for p in plans:
+        if p.note:
+            ui.warn(f"{p.id}: {p.note}")
+
+
+def cmd_scan(ctx, host, cfg, a):
+    t = core.now()
+    plans = build_plans(host, cfg, ctx, t)
+    mounts = mount_usage(host)
+    top = []
+    for m in host.mounts():
+        d = sysinfo.dir_sizes(m["mount"], top=10, budget_s=host.budget_s)
+        top.append({"mount": m["mount"], "complete": d["complete"], "entries": [{"name": n, "bytes": b} for n, b in d["entries"]]})
+    big, big_complete = large_files(host, cfg)
+    report = report_only(host, cfg, ctx, t)
+    total = sum(p.bytes for p in plans if p.default)
+    ui.section("Disk usage")
+    ui.table([[u["mount"], core.human(u["total"]), core.human(u["used"]), core.human(u["free"]), f"{u['percent']}%"] for u in mounts],
+             ["Mount", "Size", "Used", "Free", "Use"])
+    for d in top:
+        ui.section(f"Largest items on {d['mount']}" + ("" if d["complete"] else " (partial, time budget reached)"))
+        ui.table([[e["name"], core.human(e["bytes"])] for e in d["entries"]])
+    ui.section(f"Files of {cfg['large_file_mb']} MB or more" + ("" if big_complete else " (partial, time budget reached)"))
+    ui.table([[f["path"], core.human(f["bytes"])] for f in big] or [["none found"]])
+    ui.section("What can be cleaned")
+    show_plans(plans)
+    ui.info(f"Selected by default: about {core.human(total)} recoverable. Run: synk-clean run")
+    ui.section("Reported only, never deleted by synk-clean")
+    for r in report["old_releases"]:
+        ui.say(f"old softsynk release {r['name']}: {core.human(r['bytes'])} ({r['path']})")
+    if report["autoremove"]:
+        ui.say(f"{report['autoremove']} packages are no longer needed (apt autoremove, includes old kernels)")
+    for k, hint in (("docker", "Docker is installed: unused images and volumes are not touched here"),
+                    ("snap", "snap is installed: old snap revisions are not touched here")):
+        if report[k]:
+            ui.say(hint)
+    if report["old_backups"]:
+        ui.say(f"{report['old_backups']} softsynk change backups are older than {OLD_BACKUP_DAYS} days")
+    return core.OK
+
+
+# ---------------------------------------------------------------- run
+
+def free_bytes(host):
+    return sum(u["free"] for u in mount_usage(host))
+
+
+def cmd_run(ctx, host, cfg, a):
+    only = [x.strip() for x in a.only.split(",") if x.strip()] if a.only else []
+    bad = [x for x in only if x not in IDS]
+    if bad:
+        raise core.Fail(f"unknown category {', '.join(bad)} (use: {', '.join(IDS)})", core.USAGE)
+    with contextlib.nullcontext() if a.dry_run else core.lock(ctx):
+        ui.info("Measuring what can be cleaned...")
+        plans = build_plans(host, cfg, ctx)
+        show_plans(plans, a.json)
+        cands = [p for p in plans if (p.bytes or p.files) and (not only or p.id in only)]
+        if not cands:
+            ui.info("Nothing to clean.")
+            return emit(a, {"freed_bytes": 0, "estimated_bytes": 0, "categories": {}, "errors": []})
+        if a.dry_run:
+            chosen = [p for p in cands if p.id in only or (not only and p.default)]
+            ui.info(f"Dry run: would clean {', '.join(p.id for p in chosen) or 'nothing'} "
+                    f"(about {core.human(sum(p.bytes for p in chosen))}). Nothing was changed.")
+            return core.OK
+        if only:
+            chosen = cands if ui.confirm(f"Clean {', '.join(p.id for p in cands)} (about {core.human(sum(p.bytes for p in cands))})?", True) else []
+        else:
+            chosen = [p for p in cands if ui.confirm(f"Clean {p.title}: {core.human(p.bytes)}?", p.default)]
+        if not chosen:
+            ui.info("Nothing was changed.")
+            return emit(a, {"freed_bytes": 0, "estimated_bytes": 0, "categories": {}, "errors": []})
+        before, cats, errors = free_bytes(host), {}, []
+        for p in chosen:
+            ui.info(f"Cleaning {p.title}...")
+            try:
+                r = p.do()
+            except Exception as e:  # one failing category must not stop the others
+                r = {"files": 0, "bytes": 0, "errors": [f"{type(e).__name__}: {e}"]}
+            cats[p.id] = {"files": r["files"], "bytes": r["bytes"], "errors": len(r["errors"])}
+            errors += [f"{p.id}: {e}" for e in r["errors"]]
+        freed, est = max(0, free_bytes(host) - before), sum(p.bytes for p in chosen)
+        doc = {"at": core.iso(core.now()), "freed_bytes": freed, "estimated_bytes": est, "categories": cats, "errors": errors}
+        core.write_json(ctx.path("state", "last-run.json"), doc)
+        core.log(ctx, "clean.run", **doc)
+        for e in errors:
+            ui.error(e)
+        (ui.warn if errors else ui.ok)(f"Freed {core.human(freed)} (estimated {core.human(est)}).")
+        emit(a, doc)
+        return core.FAILED if errors else core.OK
+
+
+def emit(a, doc):
+    if a.json:
+        print(json.dumps(doc, indent=2))
+    return core.OK
+
+
+# ---------------------------------------------------------------- setup
+
+def render_journald(max_use):
+    return f"{HEADER}[Journal]\nSystemMaxUse={max_use}\n"
+
+
+def render_logrotate(apps, days):
+    stanza = ("{logs}/laravel.log {{\n    su {user} {group}\n    daily\n    rotate {days}\n    compress\n    delaycompress\n"
+              "    missingok\n    notifempty\n    copytruncate\n}}\n")
+    return HEADER + "\n" + "\n".join(stanza.format(logs=a.logs, user=a.user, group=a.group, days=days) for a in apps if safe_app(a))
+
+
+def check_size(v):
+    return None if SIZE_RE.match(v) else "use a number with K, M, G or T, like 500M"
+
+
+def check_days(v):
+    return None if v.isdigit() and int(v) >= 1 else "use a whole number of days, 1 or more"
+
+
+def current_value(path, key):
+    with contextlib.suppress(OSError), open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+def cmd_setup(ctx, host, cfg, a):
+    apps, notes = find_apps(host, cfg)
+    for n in notes:
+        ui.warn(n)
+    safe = [x for x in apps if safe_app(x)]
+    for x in apps:
+        if x not in safe:
+            ui.warn(f"{x.path}: unusual path or owner name, not added to the logrotate rules")
+    cap = current_value(host.journald_conf, "SystemMaxUse")
+    findings = [ui.Finding("journald", "info", "Journal size cap",
+                           f"SystemMaxUse={cap}" if cap else "no softsynk cap (journald default: 10% of the filesystem, at most 4G)",
+                           cfg["journal_max"], "The systemd journal can no longer grow without limit",
+                           "Journal entries beyond the cap are dropped, oldest first; systemd-journald is restarted (no reboot)", check_size)]
+    if safe:
+        findings.append(ui.Finding("logrotate", "info", "Laravel log rotation (days kept)",
+                                   "softsynk rules present" if os.path.exists(host.logrotate_conf) else "no softsynk rules",
+                                   str(cfg["laravel_rotate_days"]),
+                                   f"storage/logs/laravel.log of {len(safe)} app(s) rotates daily and is compressed",
+                                   "Only laravel.log is rotated (copytruncate); a few log lines can be lost at the moment of rotation",
+                                   check_days))
+    vals = {f.id: f.proposed for f in ui.review(findings)}
+    if not vals:
+        ui.info("Nothing selected; no changes.")
+        return core.OK
+    steps = []
+    if "journald" in vals:
+        def journald_ok():
+            return None if host.run(["systemctl", "is-active", "systemd-journald"], timeout=20).ok else "systemd-journald is not active after the restart"
+        steps.append((change.Edit(host.journald_conf, render_journald(vals["journald"]), 0o644),
+                      dict(reload=["systemctl", "restart", "systemd-journald"], verify=journald_ok)))
+    if "logrotate" in vals:
+        steps.append((change.Edit(host.logrotate_conf, render_logrotate(safe, int(vals["logrotate"])), 0o644),
+                      dict(validate=["logrotate", "-d", host.logrotate_conf], precheck=os.path.exists(host.logrotate_conf))))
+    changed = ui.preview([e for e, _ in steps])
+    if a.dry_run:
+        ui.info("Dry run: nothing was written.")
+        return core.OK
+    if changed and not ui.confirm("Write these files?", True):
+        ui.info("Nothing was changed.")
+        return core.OK
+    failed = 0
+    with core.lock(ctx):
+        for edit, kw in steps:
+            try:
+                change.apply(ctx, [edit], run=host.run, **kw)
+            except core.Fail as f:
+                failed += 1
+                ui.error(str(f))
+        if failed:
+            return core.FAILED
+        raw = core.read_json(ctx.config_path) or {}
+        new = dict(raw)
+        if "journald" in vals:
+            new["journal_max"] = vals["journald"]
+        if "logrotate" in vals:
+            new["laravel_rotate_days"] = int(vals["logrotate"])
+        if new != raw:
+            core.write_json(ctx.config_path, new)
+        core.log(ctx, "clean.setup", files=[e.path for e, _ in steps], values=vals)
+    ui.ok("Housekeeping is set up." if changed else "Already up to date.")
+    return core.OK
+
+
+# ---------------------------------------------------------------- status
+
+def status(ctx, host):
+    warnings = []
+    managed = [p for p in (host.journald_conf, host.logrotate_conf) if os.path.exists(p)]
+    last = None
+    try:
+        last = core.read_json(ctx.path("state", "last-run.json"))
+    except core.Corrupt as c:
+        warnings.append(f"last run record is unreadable: {c}")
+    try:
+        cfg = load_cfg(ctx)
+    except core.Fail as f:
+        cfg = DEFAULTS
+        warnings.append(str(f))
+    if isinstance(last, dict) and last.get("errors"):
+        warnings.append("last cleanup had errors: " + "; ".join(map(str, last["errors"][:3])))
+    details = {"managed_files": managed, "config": {k: cfg[k] for k in ("keep_days", "journal_max", "laravel_rotate_days")},
+               "last_run": {"at": last.get("at"), "freed_bytes": last.get("freed_bytes", 0)} if isinstance(last, dict) else None}
+    if not managed:
+        return core.status_doc(MODULE, VERSION, "not_installed", "unknown", "Journal cap and Laravel log rotation are not set up", details,
+                               warnings, ["Run /usr/local/bin/synk-clean setup"])
+    ran = f"last cleanup {last.get('at')} freed {core.human(last.get('freed_bytes', 0))}" if isinstance(last, dict) else "cleanup never run"
+    return core.status_doc(MODULE, VERSION, "installed", "degraded" if warnings else "healthy", f"Set up; {ran}", details, warnings)
+
+
+# ---------------------------------------------------------------- command line
+
+def build_parser():
+    p = core.Parser(prog="synk-clean", description="Find what fills the disk, preview what can safely go, delete it after a yes.",
+                    epilog="exit codes: 0 ok, 2 something failed, 64 usage or config error, 130 cancelled. "
+                           "--status-json always exits 0.")
+    core.common_args(p)
+    p.add_argument("--status-json", action="store_true", help="status JSON for softsynk-server (module contract; always exits 0)")
+    sub = p.add_subparsers(dest="cmd", parser_class=core.Parser, metavar="COMMAND")
+    for name, help_ in (("scan", "show usage, large files and what can be cleaned (read-only)"),
+                        ("run", "preview, confirm and clean"),
+                        ("setup", "set the journald size cap and Laravel log rotation rules")):
+        s = sub.add_parser(name, help=help_)
+        core.common_args(s, json=name != "scan")
+        if name == "run":
+            s.add_argument("--only", help=f"comma separated categories: {','.join(IDS)}")
+    return p
+
+
+def _main(argv, host):
+    p = build_parser()
+    a = core.parse_args(p, argv)
+    a.dry_run = a.dry_run or os.environ.get("SOFTSYNK_DRY_RUN") == "1"  # how softsynk-server passes its --dry-run
+    ui.setup(a)
+    ctx = core.Ctx(MODULE, a.root)
+    host = host or default_host(ctx)
+    if a.status_json:
+        try:
+            doc = status(ctx, host)
+        except Exception as e:  # the contract: --status-json always answers and exits 0
+            doc = core.status_doc(MODULE, VERSION, "unknown", "unknown", f"status failed: {e}")
+        print(json.dumps(doc))
+        return core.OK
+    if not a.cmd:
+        p.print_help(sys.stderr)
+        return core.USAGE
+    return {"scan": cmd_scan, "run": cmd_run, "setup": cmd_setup}[a.cmd](ctx, host, load_cfg(ctx), a)
+
+
+def main(argv=None, host=None):
+    return core.main(lambda: _main(argv, host), prog="synk-clean")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

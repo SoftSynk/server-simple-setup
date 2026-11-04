@@ -1,0 +1,28 @@
+schema = 1
+id = "monitor"
+name = "Health monitor"
+description = "Checks disk, memory, cpu, services and failed units every 5 minutes, keeps 7 days of history and mails when something needs attention, with what to do about it; synk-dash shows it live"
+version = "1.0.0"
+interface = 1
+requires = []
+after = ["notify"]
+effects = [
+  "stores the monitor settings under the management root (etc/monitor/config.json); state, history (7 days, at most 1 GB) and log stay under the same root",
+  "writes the systemd units softsynk-monitor.service and softsynk-monitor.timer to /etc/systemd/system, runs systemctl daemon-reload and enables the timer",
+  "sends mail through synk-notify when something needs attention, when it is over, and a weekly summary (set up mail with synk-notify configure)",
+  "links /usr/local/bin/synk-monitor and /usr/local/bin/synk-dash when bootstrap.sh runs",
+]
+
+# Python 3.11+ (the shared lib needs it) is the only requirement; Ubuntu 24.04 ships 3.12.
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install   = ["synk-monitor", "setup"]
+configure = ["synk-monitor", "setup"]
+status    = ["synk-monitor", "--status-json"]
+
+[commands]
+synk-monitor = "synk-monitor"
+synk-dash    = "synk-dash"

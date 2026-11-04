@@ -1,0 +1,16 @@
+schema = 1
+id = "cmds"
+name = "Cmds"
+description = "Fixture that ships command-line tools"
+version = "1.0.0"
+interface = 1
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "ok"]
+status = ["run.sh", "status", "healthy"]
+
+[commands]
+synk-one = "one"
+synk-two = "sub/two"
