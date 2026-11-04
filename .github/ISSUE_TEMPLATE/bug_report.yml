@@ -1,0 +1,38 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security problem? Do not file it here. See SECURITY.md."
+  - type: input
+    id: module
+    attributes:
+      label: Module or command
+      placeholder: "backup / redis / auto-updates / softsynk-server update ..."
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran.
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: "Paste `softsynk-server --status` and the error. Remove passwords, keys, hostnames and IP addresses first."
+      render: text
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "softsynk-server 0.1.0, Ubuntu 26.04, restic 0.18.1, gum 0.17.0"
+    validations:
+      required: true
