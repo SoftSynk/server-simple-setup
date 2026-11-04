@@ -1,0 +1,1074 @@
+#!/usr/bin/env python3
+"""softsynk-server: install, configure, update and report on server modules.
+
+Python 3.11+ standard library only. No module-specific code lives here: every
+module is described by a data-only manifest (docs/module-development.md).
+Exit codes: 0 ok/healthy, 1 degraded, 2 unhealthy or failed, 3 incomplete,
+64 invalid request, 130 cancelled.
+"""
+import argparse
+import contextlib
+import dataclasses
+import datetime
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import tomllib
+import uuid
+
+INTERFACE = 1  # module contract version this engine speaks
+SCHEMA = 1  # registry, manifest and status-JSON format version
+DEFAULT_ROOT = "/opt/softsynk-server-management"
+
+OK, DEGRADED, FAILED, INCOMPLETE, USAGE, CANCELLED = 0, 1, 2, 3, 64, 130
+UNHEALTHY = FAILED
+
+ID_RE = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+VERSION_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$")
+SHA_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+OS_VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+)*$")
+OPS = ("install", "configure", "status", "validate", "update")
+REQUIRED_OPS = ("install", "status")
+INSTALL_STATES = ("installed", "adopted", "not_installed", "unknown")
+HEALTHS = ("healthy", "degraded", "unhealthy", "unknown", "stale", "unsupported")
+HEALTH_EXIT = {"healthy": OK, "degraded": DEGRADED, "unhealthy": UNHEALTHY,
+               "unknown": INCOMPLETE, "stale": INCOMPLETE}
+# Worst-wins ordering of exit codes: a known failure outranks "cannot tell".
+SEVERITY = {OK: 0, DEGRADED: 1, INCOMPLETE: 2, UNHEALTHY: 3}
+OVERALL_LABEL = {OK: "healthy", DEGRADED: "degraded", UNHEALTHY: "unhealthy",
+                 INCOMPLETE: "incomplete"}
+COMMANDS = ("install", "configure", "update", "validate")
+
+
+class Fail(Exception):
+    def __init__(self, message, code=FAILED):
+        super().__init__(message)
+        self.code = code
+
+
+class Cancelled(Exception):
+    pass
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"softsynk-server: {msg}", file=sys.stderr, flush=True)
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- files
+
+def release_dir():
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def read_version(release):
+    try:
+        with open(os.path.join(release, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def atomic_write(path, text, mode=0o644):
+    """Write text so readers see the old or the new file, never a partial one."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+    dfd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def set_link(root, name, target):
+    """Atomically point <root>/<name> at target (new symlink, then rename)."""
+    tmp = os.path.join(root, f".{name}.new-{os.getpid()}")
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    os.symlink(target, tmp)
+    os.replace(tmp, os.path.join(root, name))
+
+
+@contextlib.contextmanager
+def framework_lock(root):
+    """Global non-blocking lock for mutating commands; released on exit or crash."""
+    path = os.path.join(root, "lock", "framework.lock")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        raise Fail(f"cannot create lock {path}: {e.strerror} (need root?)")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise Fail(f"another softsynk-server command is running (lock: {path})")
+    try:
+        yield
+    finally:
+        os.close(fd)  # closing drops the flock
+
+
+def record_history(ctx, command, results, code, **extra):
+    path = os.path.join(ctx.root, "state", "framework", "history.jsonl")
+    entry = {"ts": now_iso(), "run_id": ctx.run_id, "command": command,
+             "version": ctx.version, "dry_run": ctx.dry_run, "results": results,
+             "exit": code, **extra}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            with open(path, encoding="utf-8") as f:
+                old = f.read()
+        except FileNotFoundError:
+            old = ""
+        atomic_write(path, old + json.dumps(entry, sort_keys=True) + "\n")
+    except OSError as e:
+        warn(f"could not write history ({e.strerror}); continuing")
+
+
+# ---------------------------------------------------------------- manifests
+
+@dataclasses.dataclass
+class Module:
+    id: str
+    name: str
+    description: str
+    version: str
+    requires: list
+    after: list
+    effects: list
+    platform: dict
+    ops: dict  # op name -> argv with the program as a path inside the release
+    commands: dict
+    dir: str  # module directory (cwd for its operations)
+
+
+@dataclasses.dataclass
+class Entry:
+    id: str
+    manifest: str
+    module: Module = None  # None when the manifest is invalid
+    errors: list = dataclasses.field(default_factory=list)
+    unsupported: str = None  # platform mismatch reason (manifest itself is valid)
+
+
+def resolve_inside(base, rel, release):
+    """Return the real path of base/rel, or raise ValueError if it leaves release."""
+    if not isinstance(rel, str) or not rel or "\0" in rel:
+        raise ValueError("path must be a non-empty string")
+    if os.path.isabs(rel):
+        raise ValueError(f"absolute path not allowed: {rel}")
+    if ".." in rel.split("/"):
+        raise ValueError(f"'..' not allowed in path: {rel}")
+    real = os.path.realpath(os.path.join(base, rel))
+    if os.path.commonpath([real, release]) != release:
+        raise ValueError(f"path escapes the release directory (symlink?): {rel}")
+    return real
+
+
+def check_program(rel, mod_dir, release):
+    """Validate an argv[0]/command path. Returns an error string or None."""
+    try:
+        real = resolve_inside(mod_dir, rel, release)
+    except ValueError as e:
+        return str(e)
+    if not os.path.isfile(real):
+        return f"file not found: {rel}"
+    if not os.access(real, os.X_OK):
+        return f"file is not executable: {rel}"
+    return None
+
+
+TOP_KEYS = {"schema", "id", "name", "description", "version", "interface",
+            "requires", "after", "effects", "platform", "operations", "commands"}
+
+
+def parse_manifest(release, entry):
+    """Fill entry.module, or entry.errors with every problem found."""
+    errs = entry.errors
+    try:
+        path = resolve_inside(release, entry.manifest, release)
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (ValueError, OSError, tomllib.TOMLDecodeError) as e:
+        errs.append(f"cannot read manifest {entry.manifest}: {e}")
+        return
+    mod_dir = os.path.dirname(os.path.join(release, entry.manifest))
+
+    for k in sorted(set(data) - TOP_KEYS):
+        errs.append(f"unknown field '{k}'")
+
+    def req_str(key):
+        v = data.get(key)
+        if not isinstance(v, str) or not v.strip():
+            errs.append(f"missing or empty required field '{key}' (string)")
+            return ""
+        return v
+
+    def str_list(key, pattern=None):
+        v = data.get(key, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+            errs.append(f"'{key}' must be an array of strings")
+            return []
+        if pattern:
+            for x in v:
+                if not pattern.match(x):
+                    errs.append(f"'{key}' has an invalid module id: {x!r}")
+        return v
+
+    schema = data.get("schema")
+    if type(schema) is not int or schema != SCHEMA:
+        errs.append(f"unsupported or missing manifest schema {schema!r} (expected {SCHEMA})")
+    interface = data.get("interface")
+    if type(interface) is not int:
+        errs.append("missing required field 'interface' (integer)")
+    elif interface != INTERFACE:
+        errs.append(f"unsupported interface {interface} (this engine supports interface {INTERFACE})")
+    if data.get("id") != entry.id:
+        errs.append(f"manifest id {data.get('id')!r} does not match registry id {entry.id!r}")
+    name, description, version = req_str("name"), req_str("description"), req_str("version")
+    if version and not VERSION_RE.match(version):
+        errs.append(f"invalid version {version!r}")
+    requires = str_list("requires", ID_RE)
+    after = str_list("after", ID_RE)
+    effects = str_list("effects")
+
+    platform = data.get("platform", {})
+    if not isinstance(platform, dict) or set(platform) - {"os", "min_version"}:
+        errs.append("[platform] must be a table with only 'os' and 'min_version'")
+        platform = {}
+    else:
+        os_list = platform.get("os", [])
+        if not isinstance(os_list, list) or not all(isinstance(x, str) for x in os_list):
+            errs.append("platform.os must be an array of strings")
+        mv = platform.get("min_version", "")
+        if not isinstance(mv, str) or (mv and not OS_VERSION_RE.match(mv)):
+            errs.append("platform.min_version must be a string like \"24.04\"")
+
+    ops = {}
+    raw = data.get("operations")
+    if not isinstance(raw, dict):
+        errs.append("[operations] table is required")
+        raw = {}
+    for k in sorted(set(raw) - set(OPS)):
+        errs.append(f"unknown operation '{k}' (known: {', '.join(OPS)})")
+    for k in REQUIRED_OPS:
+        if k not in raw:
+            errs.append(f"operations.{k} is required")
+    for k, argv in raw.items():
+        if k not in OPS:
+            continue
+        if isinstance(argv, str):
+            errs.append(f"operations.{k} must be an argv array, not a shell string: {argv!r}")
+        elif (not isinstance(argv, list) or not argv
+              or not all(isinstance(a, str) for a in argv) or not argv[0]):
+            errs.append(f"operations.{k} must be a non-empty array of strings")
+        else:
+            problem = check_program(argv[0], mod_dir, release)
+            if problem:
+                errs.append(f"operations.{k}: {problem}")
+            else:
+                ops[k] = [os.path.join(mod_dir, argv[0])] + argv[1:]
+
+    commands = {}
+    raw_cmds = data.get("commands", {})
+    if not isinstance(raw_cmds, dict):
+        errs.append("[commands] must be a table of name = \"path\"")
+        raw_cmds = {}
+    for cname, rel in raw_cmds.items():
+        if not ID_RE.match(cname):
+            errs.append(f"commands: invalid command name {cname!r}")
+        problem = check_program(rel, mod_dir, release) if isinstance(rel, str) else "path must be a string"
+        if problem:
+            errs.append(f"commands.{cname}: {problem}")
+        else:
+            commands[cname] = os.path.join(mod_dir, rel)
+
+    if not errs:
+        entry.module = Module(entry.id, name, description, version, requires, after,
+                              effects, platform, ops, commands, mod_dir)
+
+
+def os_info():
+    path = os.environ.get("SOFTSYNK_OS_RELEASE", "/etc/os-release")  # env: test hook
+    info = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep:
+                    info[k] = v.strip("\"'")
+    except OSError:
+        pass
+    return info.get("ID", "").lower(), info.get("VERSION_ID", "")
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in v.split(".")) if OS_VERSION_RE.match(v or "") else None
+
+
+def platform_problem(mod):
+    allowed = [x.lower() for x in mod.platform.get("os", [])]
+    min_version = mod.platform.get("min_version", "")
+    if not allowed and not min_version:
+        return None
+    os_id, os_version = os_info()
+    if allowed and os_id not in allowed:
+        return f"unsupported platform: needs {'/'.join(allowed)}, found {os_id or 'unknown'}"
+    if min_version:
+        have, need = version_tuple(os_version), version_tuple(min_version)
+        if have is None or have < need:
+            return f"unsupported platform: needs {os_id} >= {min_version}, found {os_version or 'unknown'}"
+    return None
+
+
+class Registry:
+    """modules.toml plus validated manifests, in dependency order."""
+
+    def __init__(self, release):
+        self.release = os.path.realpath(release)
+        self.entries = {}
+        self._load()
+        self._check_graph()
+        self.order = self._order()
+
+    def _load(self):
+        path = os.path.join(self.release, "modules.toml")
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            raise Fail(f"cannot read registry {path}: {e}")
+        if type(data.get("schema")) is not int or data["schema"] != SCHEMA:
+            raise Fail(f"modules.toml: unsupported or missing schema {data.get('schema')!r} (expected {SCHEMA})")
+        extra = set(data) - {"schema", "modules"}
+        if extra:
+            raise Fail(f"modules.toml: unknown field(s) {sorted(extra)}")
+        modules = data.get("modules", [])
+        if not isinstance(modules, list):
+            raise Fail("modules.toml: 'modules' must be an array of [[modules]] tables")
+        for item in modules:
+            if (not isinstance(item, dict) or set(item) != {"id", "manifest"}
+                    or not isinstance(item["id"], str) or not isinstance(item["manifest"], str)):
+                raise Fail("modules.toml: each [[modules]] needs exactly 'id' and 'manifest' strings")
+            if not ID_RE.match(item["id"]):
+                raise Fail(f"modules.toml: invalid module id {item['id']!r} (pattern {ID_RE.pattern})")
+            if item["id"] in self.entries:
+                raise Fail(f"modules.toml: duplicate module id {item['id']!r}")
+            entry = Entry(item["id"], item["manifest"])
+            self.entries[entry.id] = entry
+            parse_manifest(self.release, entry)
+        for e in self.entries.values():
+            if e.module:
+                for r in e.module.requires:
+                    if r not in self.entries:
+                        e.errors.append(f"requires unknown module '{r}'")
+                if e.errors:
+                    e.module = None
+
+    def _graph(self):
+        valid = {i for i, e in self.entries.items() if e.module}
+        return {i: [d for d in e.module.requires + e.module.after if d in valid]
+                for i, e in self.entries.items() if e.module}
+
+    def _check_graph(self):
+        """Mark every module on a dependency cycle (requires or after) invalid."""
+        graph = self._graph()
+        state, path, cycles = {}, [], []
+
+        def visit(n):
+            if state.get(n) == 2:
+                return
+            if state.get(n) == 1:
+                cycles.append(path[path.index(n):] + [n])
+                return
+            state[n] = 1
+            path.append(n)
+            for d in graph[n]:
+                visit(d)
+            path.pop()
+            state[n] = 2
+
+        for n in graph:
+            visit(n)
+        for cyc in cycles:
+            text = "dependency cycle: " + " -> ".join(cyc)
+            for n in set(cyc):
+                e = self.entries[n]
+                e.module = None
+                if text not in e.errors:
+                    e.errors.append(text)
+        for e in self.entries.values():
+            if e.module:
+                e.unsupported = platform_problem(e.module)
+
+    def _order(self):
+        """Dependencies first; registry order breaks ties. Valid modules only."""
+        graph, seen, order = self._graph(), set(), []
+
+        def visit(n):
+            if n in seen:
+                return
+            seen.add(n)
+            for d in graph[n]:
+                visit(d)
+            order.append(n)
+
+        for n in graph:
+            visit(n)
+        return order
+
+    def unusable(self, mid, _depth=0):
+        """Why a module cannot be installed/run (None if it can)."""
+        e = self.entries[mid]
+        if e.module is None:
+            more = f" (+{len(e.errors) - 1} more)" if len(e.errors) > 1 else ""
+            return f"invalid manifest: {e.errors[0]}{more}"
+        if e.unsupported:
+            return e.unsupported
+        for r in e.module.requires:
+            why = self.unusable(r)
+            if why:
+                return f"requires {r}, which is unusable ({why})"
+        return None
+
+
+# ---------------------------------------------------------------- context
+
+@dataclasses.dataclass
+class Ctx:
+    root: str
+    release: str
+    version: str
+    noninteractive: bool
+    accept_defaults: bool
+    dry_run: bool
+    run_id: str
+    status_timeout: float
+
+
+def module_env(ctx, mod):
+    env = dict(os.environ)
+    env.pop("SOFTSYNK_LOCK_HELD", None)
+    for key, sub in (("ETC", "etc"), ("SECRETS", "secrets"), ("STATE", "state"),
+                     ("LOG", "log"), ("TMP", "tmp")):
+        env[f"SOFTSYNK_{key}_DIR"] = os.path.join(ctx.root, sub, mod.id)
+    env.update(
+        SOFTSYNK_ROOT=ctx.root,
+        SOFTSYNK_MODULE=mod.id,
+        SOFTSYNK_INTERACTIVE="0" if ctx.noninteractive else "1",
+        SOFTSYNK_NONINTERACTIVE="1" if ctx.noninteractive else "0",
+        SOFTSYNK_ACCEPT_DEFAULTS="1" if ctx.accept_defaults else "0",
+        SOFTSYNK_DRY_RUN="1" if ctx.dry_run else "0",
+        SOFTSYNK_RUN_ID=ctx.run_id,
+    )
+    return env
+
+
+# ---------------------------------------------------------------- status
+
+def blank_record(entry, health="unknown", state="unknown", summary=""):
+    m = entry.module
+    return {"module": entry.id, "name": m.name if m else entry.id,
+            "version": m.version if m else "", "observed_at": now_iso(),
+            "install_state": state, "health": health, "summary": summary,
+            "details": {}, "warnings": [], "actions": []}
+
+
+def check_status_doc(doc, mid):
+    """Return (normalized fields, None) or (None, problem)."""
+    if not isinstance(doc, dict):
+        return None, "status output is not a JSON object"
+    schema = doc.get("schema")
+    if type(schema) is not int or schema != SCHEMA:
+        return None, f"unsupported status schema {schema!r} (expected {SCHEMA})"
+    if doc.get("module") != mid:
+        return None, f"status is for module {doc.get('module')!r}, expected {mid!r}"
+    if doc.get("install_state") not in INSTALL_STATES:
+        return None, f"invalid install_state {doc.get('install_state')!r}"
+    if doc.get("health") not in HEALTHS:
+        return None, f"invalid health {doc.get('health')!r}"
+    out = {"install_state": doc["install_state"], "health": doc["health"]}
+    for key, typ, default in (("summary", str, ""), ("version", str, None),
+                              ("observed_at", str, None), ("details", dict, {}),
+                              ("warnings", list, []), ("actions", list, [])):
+        v = doc.get(key, default)
+        if v is None:
+            continue
+        if not isinstance(v, typ):
+            return None, f"'{key}' must be of type {typ.__name__}"
+        out[key] = v
+    if not all(isinstance(w, str) for w in out.get("warnings", [])):
+        return None, "'warnings' must be an array of strings"
+    return out, None
+
+
+def run_status(ctx, entry):
+    """Run a module's status op under a timeout. Always returns a record."""
+    mod = entry.module
+    rec = blank_record(entry)
+    try:
+        p = subprocess.Popen(mod.ops["status"], cwd=mod.dir, env=module_env(ctx, mod),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        rec["summary"] = "status could not be started"
+        rec["warnings"].append(f"cannot run status: {e.strerror}")
+        return rec
+    try:
+        out, _ = p.communicate(timeout=ctx.status_timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        rec["summary"] = "status timed out"
+        rec["warnings"].append(f"status timed out after {ctx.status_timeout:g}s")
+        return rec
+    except BaseException:
+        kill_group(p)
+        raise
+    try:
+        doc = json.loads(out.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        doc = None
+    fields, problem = check_status_doc(doc, mod.id) if doc is not None else (
+        None, f"status output is not valid JSON (exit {p.returncode})")
+    if problem:
+        rec["summary"] = "status unreadable"
+        rec["warnings"].append(problem)
+        return rec
+    rec.update(fields)
+    return rec
+
+
+def kill_group(p):
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(p.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        p.communicate(timeout=5)
+
+
+def collect_status(ctx, reg, ids=None):
+    """Sequential status of every (or the given) module -> list of records."""
+    records = []
+    for mid, e in reg.entries.items():
+        if ids is not None and mid not in ids:
+            continue
+        if e.module is None:
+            rec = blank_record(e, summary="invalid manifest")
+            rec["warnings"] = list(e.errors)
+        elif e.unsupported:
+            rec = blank_record(e, health="unsupported", summary=e.unsupported)
+        else:
+            rec = run_status(ctx, e)
+        records.append(rec)
+    return records
+
+
+def exit_for(records):
+    """Worst exit code over modules that count (installed/adopted/unknown)."""
+    code = OK
+    for r in records:
+        if r["health"] == "unsupported" or r["install_state"] == "not_installed":
+            continue
+        c = HEALTH_EXIT[r["health"]]
+        if SEVERITY[c] > SEVERITY[code]:
+            code = c
+    return code
+
+
+def table(headers, rows):
+    widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
+    return "\n".join("  ".join(str(c).ljust(w) for c, w in zip(r, widths)).rstrip()
+                     for r in [headers] + rows)
+
+
+def cmd_status(ctx, reg, as_json):
+    records = collect_status(ctx, reg)
+    code = exit_for(records)
+    if as_json:
+        say(json.dumps({"schema": SCHEMA, "framework": {"version": ctx.version, "interface": INTERFACE},
+                        "observed_at": now_iso(),
+                        "overall": {"health": OVERALL_LABEL[code], "exit_code": code},
+                        "modules": records}, indent=2, sort_keys=True))
+        return code
+    say(f"softsynk-server {ctx.version} (interface {INTERFACE}), root {ctx.root}")
+    rows = [(r["module"], r["install_state"], r["health"], r["summary"]) for r in records]
+    say(table(("MODULE", "INSTALL", "HEALTH", "SUMMARY"), rows) if rows else "no modules registered")
+    for r in records:
+        for w in r["warnings"]:
+            say(f"  ! {r['module']}: {w}")
+    ignored = sum(1 for r in records if r["install_state"] == "not_installed")
+    if ignored:
+        say(f"{ignored} module(s) not installed (not counted in health)")
+    say(f"overall: {OVERALL_LABEL[code]} (exit {code})")
+    return code
+
+
+def cmd_list(ctx, reg):
+    records = {r["module"]: r for r in collect_status(ctx, reg)}
+    rows = []
+    for mid, e in reg.entries.items():
+        notes = []
+        if e.module is None:
+            notes.append(reg.unusable(mid))
+        else:
+            if e.unsupported:
+                notes.append(e.unsupported)
+            for r in e.module.requires:
+                why = reg.unusable(r)
+                if why:
+                    notes.append(f"blocked: requires {r} ({why})")
+                elif records[r]["install_state"] not in ("installed", "adopted"):
+                    notes.append(f"requires {r} (not installed)")
+        platform = "unsupported" if e.unsupported else ("invalid" if e.module is None else "ok")
+        rows.append((mid, e.module.version if e.module else "-", records[mid]["install_state"],
+                     platform, "; ".join(notes)))
+    say(table(("MODULE", "VERSION", "INSTALL", "PLATFORM", "NOTES"), rows) if rows else "no modules registered")
+    return OK
+
+
+def cmd_validate(ctx, reg):
+    bad = 0
+    for mid, e in reg.entries.items():
+        if e.module is None:
+            bad += 1
+            say(f"INVALID {mid} ({e.manifest})")
+            for msg in e.errors:
+                say(f"  - {msg}")
+        else:
+            say(f"ok      {mid} ({e.manifest})" + (f"  [{e.unsupported}]" if e.unsupported else ""))
+    say(f"{len(reg.entries) - bad} valid, {bad} invalid")
+    return FAILED if bad else OK
+
+
+# ---------------------------------------------------------------- prompts
+
+def gum_cmd():
+    return shutil.which("gum")
+
+
+def _gum(args, capture=True):
+    p = subprocess.run([gum_cmd()] + args, stdout=subprocess.PIPE if capture else None, text=True)
+    return p.returncode, p.stdout or ""
+
+
+def ui_choose(header, options, many=False):
+    """Return the chosen option(s). Raises Cancelled on Ctrl-C/Esc."""
+    if gum_cmd():
+        rc, out = _gum(["choose", "--header", header] + (["--no-limit"] if many else []) + list(options))
+        if rc != 0:
+            raise Cancelled()
+        return [x for x in out.splitlines() if x]
+    while True:
+        say(header)
+        for i, o in enumerate(options, 1):
+            say(f"  {i}) {o}")
+        try:
+            raw = input("number" + ("s (blank = none)" if many else "") + ": ").replace(",", " ").split()
+        except EOFError:
+            raise Cancelled()
+        if all(x.isdigit() and 1 <= int(x) <= len(options) for x in raw) and (raw or many) and (many or len(raw) == 1):
+            return [options[int(x) - 1] for x in raw]
+        say("invalid choice")
+
+
+def ui_confirm(question):
+    """Yes (default) / No. Raises Cancelled on Ctrl-C/Esc/EOF."""
+    if gum_cmd():
+        rc, _ = _gum(["confirm", question], capture=False)
+        if rc == 0:
+            return True
+        if rc == 1:
+            return False
+        raise Cancelled()
+    try:
+        return input(f"{question} [Y/n] ").strip().lower() not in ("n", "no")
+    except EOFError:
+        raise Cancelled()
+
+
+def ui_input(header):
+    if gum_cmd():
+        rc, out = _gum(["input", "--header", header])
+        if rc != 0:
+            raise Cancelled()
+        return out.strip()
+    try:
+        return input(f"{header} ").strip()
+    except EOFError:
+        raise Cancelled()
+
+
+def confirm(ctx, question):
+    """Interactive confirm; non-interactive proceeds only with --accept-defaults."""
+    if ctx.noninteractive:
+        if ctx.accept_defaults:
+            return True
+        raise Fail(f"confirmation required for '{question}'; re-run with --accept-defaults", USAGE)
+    return ui_confirm(question)
+
+
+# ---------------------------------------------------------------- install / configure
+
+def run_tty(ctx, mod, op):
+    """Run a mutating op with the terminal attached. Returns the exit code."""
+    previous = signal.signal(signal.SIGINT, lambda *_: None)  # Ctrl-C goes to the child; handlers reset on exec
+    try:
+        try:
+            return subprocess.call(mod.ops[op], cwd=mod.dir, env=module_env(ctx, mod))
+        except OSError as e:
+            warn(f"cannot run {mod.id} {op}: {e.strerror}")
+            return FAILED
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def classify(rc):
+    if rc == 0:
+        return "ok"
+    if rc in (CANCELLED, -signal.SIGINT):
+        return "cancelled"
+    return "failed"
+
+
+def installed(status, mid):
+    return mid in status and status[mid]["install_state"] in ("installed", "adopted")
+
+
+def static_blocks(reg, ordered, selected, status):
+    """Blocked reasons known before running anything: id -> reason."""
+    blocked = {}
+    for mid in ordered:
+        why = reg.unusable(mid)
+        if not why:
+            for r in reg.entries[mid].module.requires:
+                if r in selected:
+                    if r in blocked:
+                        why = f"requires {r}, which is blocked"
+                        break
+                elif not installed(status, r):
+                    why = f"requires {r}, which is not installed and was not selected"
+                    break
+        if why:
+            blocked[mid] = why
+    return blocked
+
+
+def pick_interactive(ctx, reg, status):
+    selected = []
+    for mid in reg.order:
+        e = reg.entries[mid]
+        m, st = e.module, status[mid]
+        if e.unsupported:
+            continue
+        if st["install_state"] in ("installed", "adopted"):
+            say(f"\n{m.name} ({mid}): already {st['install_state']}; skipped (name it to re-run: install {mid})")
+            continue
+        say(f"\n{m.name} ({mid}) v{m.version}\n  {m.description}\n  state: {st['install_state']}")
+        if m.effects:
+            say("  effects: " + "; ".join(m.effects))
+        if ui_confirm(f"Install {m.name}?"):
+            selected.append(mid)
+    return selected
+
+
+def cmd_install(ctx, reg, names):
+    unknown = [n for n in names if n not in reg.entries]
+    if unknown:
+        raise Fail(f"unknown module(s): {', '.join(unknown)} (see --list)", USAGE)
+    if not names and ctx.noninteractive:
+        raise Fail("install needs module names when non-interactive (e.g. 'install backup'; see --list)", USAGE)
+    names = list(dict.fromkeys(names))
+    with framework_lock(ctx.root):
+        valid = [i for i in reg.entries if reg.entries[i].module and not reg.entries[i].unsupported]
+        if not names:
+            status = {r["module"]: r for r in collect_status(ctx, reg, set(valid))}
+            names = pick_interactive(ctx, reg, status)
+        else:
+            need = {r for n in names if reg.entries[n].module for r in reg.entries[n].module.requires
+                    if r not in names and r in valid}
+            status = {r["module"]: r for r in collect_status(ctx, reg, need)}
+        if not names:
+            say("nothing selected")
+            return OK
+        selected = set(names)
+        ordered = [i for i in reg.order if i in selected] + [i for i in names if i not in reg.order]
+        blocked = static_blocks(reg, ordered, selected, status)
+
+        say("\nPlan" + (" (dry run)" if ctx.dry_run else "") + ":")
+        for n, mid in enumerate(ordered, 1):
+            say(f"  {n}. {mid}: " + (f"BLOCKED, {blocked[mid]}" if mid in blocked else "install"))
+        if len(blocked) < len(ordered) and not confirm(ctx, "Run this plan?"):
+            say("aborted, nothing changed")
+            return OK
+
+        results = {}
+        for mid in ordered:
+            if mid in blocked:
+                results[mid] = ("blocked", blocked[mid])
+                continue
+            mod = reg.entries[mid].module
+            dead = [r for r in mod.requires if results.get(r, ("ok",))[0] != "ok"]
+            if dead:
+                results[mid] = ("blocked", f"requires {dead[0]}, which {results[dead[0]][0]}")
+                continue
+            say(f"\n==> installing {mid}")
+            rc = run_tty(ctx, mod, "install")
+            results[mid] = (classify(rc), f"exit {rc}")
+
+        say("\nSummary:")
+        for mid in ordered:
+            state, detail = results[mid]
+            say(f"  {mid}: {state}" + ("" if state == "ok" else f" ({detail})"))
+        states = [s for s, _ in results.values()]
+        code = (FAILED if "failed" in states else CANCELLED if "cancelled" in states
+                else INCOMPLETE if "blocked" in states else OK)
+        record_history(ctx, "install", {m: {"state": s, "detail": d} for m, (s, d) in results.items()}, code)
+        return code
+
+
+def cmd_configure(ctx, reg, names):
+    if len(names) > 1:
+        raise Fail("configure takes exactly one module", USAGE)
+    if not names:
+        if ctx.noninteractive:
+            raise Fail("configure needs a module name when non-interactive (see --list)", USAGE)
+        choices = [i for i, e in reg.entries.items() if e.module and "configure" in e.module.ops]
+        if not choices:
+            raise Fail("no module declares a configure operation", USAGE)
+        names = ui_choose("Configure which module?", choices)
+    mid = names[0]
+    if mid not in reg.entries:
+        raise Fail(f"unknown module: {mid} (see --list)", USAGE)
+    why = reg.unusable(mid)
+    if why:
+        raise Fail(f"cannot configure {mid}: {why}", INCOMPLETE)
+    mod = reg.entries[mid].module
+    if "configure" not in mod.ops:
+        raise Fail(f"module {mid} does not declare a configure operation", USAGE)
+    with framework_lock(ctx.root):
+        say(f"==> configuring {mid}")
+        rc = run_tty(ctx, mod, "configure")
+        state = classify(rc)
+        code = OK if state == "ok" else CANCELLED if state == "cancelled" else FAILED
+        record_history(ctx, "configure", {mid: {"state": state, "detail": f"exit {rc}"}}, code)
+        return code
+
+
+# ---------------------------------------------------------------- update / rollback
+
+def cmd_update(ctx, src, sha):
+    if not src:
+        if ctx.noninteractive:
+            raise Fail("update needs --from DIR|TARBALL (and --sha256 for a tarball)", USAGE)
+        src = ui_input("Update source (directory or tarball path):")
+    src = os.path.abspath(os.path.expanduser(src))
+    if not os.path.exists(src):
+        raise Fail(f"update source not found: {src}", USAGE)
+    is_tar = os.path.isfile(src)
+    if is_tar and not sha:
+        if ctx.noninteractive:
+            raise Fail("--sha256 is required for a tarball source", USAGE)
+        sha = ui_input("Expected sha256 of the tarball:")
+    if sha and not is_tar:
+        raise Fail("--sha256 applies to tarball sources only", USAGE)
+    if sha and not SHA_RE.match(sha):
+        raise Fail("--sha256 must be 64 hex characters", USAGE)
+    bootstrap = os.path.join(ctx.release, "bootstrap.sh")
+    if not os.access(bootstrap, os.X_OK):
+        raise Fail(f"bootstrap.sh not found or not executable in {ctx.release}")
+    if not confirm(ctx, f"Update softsynk-server from {src}?"):
+        say("aborted, nothing changed")
+        return OK
+    with framework_lock(ctx.root):
+        cmd = [bootstrap, "--root", ctx.root, "--from", src] + (["--sha256", sha] if sha else [])
+        env = dict(os.environ, SOFTSYNK_LOCK_HELD="1")  # bootstrap must not re-take our lock
+        rc = subprocess.call(cmd, env=env)
+        code = OK if rc == 0 else FAILED
+        record_history(ctx, "update", {"framework": {"state": "ok" if rc == 0 else "failed", "detail": f"exit {rc}"}},
+                       code, source=src)
+        if rc != 0:
+            warn("update failed; the current release was not changed")
+        return code
+
+
+def release_link(root, name):
+    try:
+        return os.readlink(os.path.join(root, name))
+    except OSError:
+        return None
+
+
+def cmd_rollback(ctx):
+    if not os.path.isdir(ctx.root):
+        raise Fail(f"no installed release found under {ctx.root} (run bootstrap.sh first)")
+    with framework_lock(ctx.root):
+        cur, prev = release_link(ctx.root, "current"), release_link(ctx.root, "previous")
+        if not cur:
+            raise Fail(f"no installed release found under {ctx.root} (run bootstrap.sh first)")
+        if not prev:
+            raise Fail("no previous release recorded; nothing to roll back to")
+        releases = os.path.realpath(os.path.join(ctx.root, "releases"))
+        real = os.path.realpath(os.path.join(ctx.root, prev))
+        if os.path.dirname(real) != releases or not os.path.isdir(real):
+            raise Fail(f"previous release is missing or outside {releases}: {prev}")
+        if not confirm(ctx, f"Roll back {cur} -> {prev}?"):
+            say("aborted, nothing changed")
+            return OK
+        set_link(ctx.root, "current", prev)  # the switch itself first; then remember where we came from
+        set_link(ctx.root, "previous", cur)
+        say(f"rolled back: current -> {prev} (was {cur}); run --rollback again to return")
+        say("note: only code is reverted, not system changes modules made (config, packages, units)")
+        record_history(ctx, "rollback", {"framework": {"state": "ok", "detail": f"{cur} -> {prev}"}}, OK)
+        return OK
+
+
+# ---------------------------------------------------------------- menu / main
+
+def cmd_menu(ctx, reg):
+    items = {"Status": lambda: cmd_status(ctx, reg, False),
+             "List modules": lambda: cmd_list(ctx, reg),
+             "Install modules": lambda: cmd_install(ctx, reg, []),
+             "Configure a module": lambda: cmd_configure(ctx, reg, []),
+             "Update from directory or tarball": lambda: cmd_update(ctx, None, None),
+             "Roll back to previous release": lambda: cmd_rollback(ctx),
+             "Quit": None}
+    while True:
+        choice = ui_choose(f"softsynk-server {ctx.version}", list(items))[0]
+        if items[choice] is None:
+            return OK
+        try:
+            items[choice]()
+        except Fail as f:
+            warn(f"error: {f}")
+        except Cancelled:
+            warn("cancelled")
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        warn(f"error: {message}")
+        sys.exit(USAGE)
+
+
+EPILOG = """\
+commands:
+  install [module...]     install modules in dependency order (interactive menu when none named)
+  configure <module>      run a module's configure operation
+  update                  stage, verify and activate a new release (--from DIR|TARBALL [--sha256 HEX])
+  validate                check registry and manifests of this release (read-only)
+
+exit codes: 0 ok/healthy, 1 degraded, 2 unhealthy or failed, 3 incomplete/blocked,
+            64 invalid request or missing input, 130 cancelled
+"""
+
+
+def build_parser():
+    p = Parser(prog="softsynk-server", description="Install, configure, update and check server modules.",
+               epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("command", nargs="?", choices=COMMANDS, metavar="command")
+    p.add_argument("modules", nargs="*", metavar="module")
+    p.add_argument("--status", action="store_true", help="show module health (read-only)")
+    p.add_argument("--json", action="store_true", help="with --status: machine-readable output")
+    p.add_argument("--list", action="store_true", help="list modules with state and blockers (read-only)")
+    p.add_argument("--rollback", action="store_true", help="switch back to the previous release")
+    p.add_argument("--version", action="store_true", help="print version")
+    p.add_argument("--root", help=f"management root (default: $SOFTSYNK_ROOT or {DEFAULT_ROOT})")
+    p.add_argument("--from", dest="src", help="update source: directory or tarball")
+    p.add_argument("--sha256", help="expected sha256 of a tarball source")
+    p.add_argument("--non-interactive", action="store_true", help="never prompt (also: SOFTSYNK_NONINTERACTIVE=1)")
+    p.add_argument("--accept-defaults", action="store_true", help="non-interactive: confirm prompts with their default")
+    p.add_argument("--dry-run", action="store_true", help="install/configure: pass SOFTSYNK_DRY_RUN=1 to modules")
+    return p
+
+
+def check_args(a):
+    actions = [x for x in (a.command, a.status and "--status", a.list and "--list",
+                           a.rollback and "--rollback", a.version and "--version") if x]
+    if len(actions) > 1:
+        raise Fail(f"choose one action, got: {', '.join(actions)}", USAGE)
+    if a.json and not a.status:
+        raise Fail("--json is only valid with --status", USAGE)
+    if (a.src or a.sha256) and a.command != "update":
+        raise Fail("--from/--sha256 are only valid with update", USAGE)
+    if a.modules and a.command not in ("install", "configure"):
+        raise Fail("module names are only valid with install/configure", USAGE)
+    if a.dry_run and a.command not in ("install", "configure"):
+        raise Fail("--dry-run is only valid with install/configure", USAGE)
+
+
+def main(argv=None):
+    parser = build_parser()
+    a = parser.parse_args(argv)
+    try:
+        check_args(a)
+        release = release_dir()
+        root = os.path.abspath(a.root or os.environ.get("SOFTSYNK_ROOT") or DEFAULT_ROOT)
+        interactive = (sys.stdin.isatty() and sys.stdout.isatty() and not a.non_interactive
+                       and os.environ.get("SOFTSYNK_NONINTERACTIVE") != "1")
+        try:
+            timeout = float(os.environ.get("SOFTSYNK_STATUS_TIMEOUT", "20"))
+            if timeout <= 0:
+                raise ValueError
+        except ValueError:
+            raise Fail("SOFTSYNK_STATUS_TIMEOUT must be a positive number", USAGE)
+        ctx = Ctx(root, release, read_version(release), not interactive,
+                  a.accept_defaults or os.environ.get("SOFTSYNK_ACCEPT_DEFAULTS") == "1",
+                  a.dry_run, datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                  + "-" + uuid.uuid4().hex[:6], timeout)
+        if a.version:
+            say(f"softsynk-server {ctx.version} (module interface {INTERFACE})")
+            return OK
+        if a.rollback:
+            return cmd_rollback(ctx)
+        if a.command == "update":
+            return cmd_update(ctx, a.src, a.sha256)
+        reg = Registry(release)
+        if a.status:
+            return cmd_status(ctx, reg, a.json)
+        if a.list:
+            return cmd_list(ctx, reg)
+        if a.command == "validate":
+            return cmd_validate(ctx, reg)
+        if a.command == "install":
+            return cmd_install(ctx, reg, a.modules)
+        if a.command == "configure":
+            return cmd_configure(ctx, reg, a.modules)
+        if ctx.noninteractive:
+            parser.print_help(sys.stderr)
+            raise Fail("no command given and no terminal for the menu", USAGE)
+        return cmd_menu(ctx, reg)
+    except Fail as f:
+        warn(f"error: {f}")
+        return f.code
+    except (KeyboardInterrupt, Cancelled):
+        warn("cancelled")
+        return CANCELLED
+
+
+if __name__ == "__main__":
+    sys.exit(main())

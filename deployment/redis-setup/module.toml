@@ -1,0 +1,24 @@
+schema = 1
+id = "redis"
+name = "Redis"
+description = "Installs and tunes Redis as one shared instance or a cache and a queue instance, with a health check"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "installs redis with apt after adding the packages.redis.io repository and signing key, or installs the distribution's redis-server package when that repository has no build for the release",
+  "writes one marked managed block at the end of each Redis config file under /etc/redis; the rest of the file is left as it was, and every change is backed up first",
+  "enables and starts the redis-server service, and for a cache and queue pair installs a redis-server@.service template and enables redis-server@queue",
+  "can write /etc/sysctl.d/90-redis.conf and set vm.overcommit_memory=1 when an instance saves data to disk",
+  "starts a short-lived throwaway redis-server to check each new config before it is applied",
+  "keeps its log and lock under the management root",
+]
+
+[platform]
+os = ["ubuntu", "debian"]
+
+[operations]
+install   = ["setup-redis.sh"]
+configure = ["setup-redis.sh"]
+status    = ["setup-redis.sh", "--status-json"]

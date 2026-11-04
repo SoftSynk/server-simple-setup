@@ -1,0 +1,12 @@
+schema = 1
+id = "bad-no-status"
+name = "x"
+description = "x fixture"
+version = "1.0.0"
+interface = 1
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "ok"]
+configure = ["run.sh", "configure"]

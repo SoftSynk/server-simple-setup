@@ -1,0 +1,25 @@
+schema = 1
+id = "auto-updates"
+name = "Automatic security updates"
+description = "Turns on unattended security updates with a reboot window, restarts services after library updates and checks the result"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "installs unattended-upgrades with apt after asking when it is missing; apt may add needrestart with it",
+  "writes /etc/apt/apt.conf.d/52unattended-upgrades-local as the single managed config and never edits the distribution's own apt files",
+  "backs up every file it replaces under /var/backups/setup-auto-updates",
+  "may write /etc/needrestart/conf.d/50-setup-auto-updates.conf so services restart after library updates",
+  "enables the apt-daily and apt-daily-upgrade systemd timers when they are off",
+  "runs unattended-upgrade --dry-run after writing, which contacts the package mirrors",
+  "keeps its log and lock under the management root",
+]
+
+[platform]
+os = ["ubuntu"]
+
+[operations]
+install   = ["setup-auto-updates.sh"]
+configure = ["setup-auto-updates.sh"]
+status    = ["setup-auto-updates.sh", "--status-json"]

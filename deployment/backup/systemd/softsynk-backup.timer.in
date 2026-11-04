@@ -1,0 +1,11 @@
+[Unit]
+Description=softsynk PostgreSQL backup schedule (every 6 hours)
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00
+Persistent=true
+AccuracySec=1min
+Unit=softsynk-backup.service
+
+[Install]
+WantedBy=timers.target

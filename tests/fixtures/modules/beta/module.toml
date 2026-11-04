@@ -1,0 +1,13 @@
+schema = 1
+id = "beta"
+name = "Beta"
+description = "Beta fixture"
+version = "1.0.0"
+interface = 1
+requires = ["alpha"]
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "ok"]
+status = ["run.sh", "status", "degraded"]
+configure = ["run.sh", "configure"]

@@ -1,0 +1,27 @@
+schema = 1
+id = "backup"
+name = "Database backups"
+description = "PostgreSQL dumps to local disk and an S3-compatible bucket with restic, every 6 hours"
+version = "1.0.0"
+interface = 1
+requires = []
+after = []
+effects = [
+  "installs restic and gum with apt when they are missing",
+  "reads PostgreSQL as the postgres OS user (runuser) and creates short-lived softsynk_restore_test_* databases during restore tests",
+  "stores the restic repository, repository password, S3 keys, state and logs under the management root",
+  "writes systemd units softsynk-backup.service, softsynk-backup.timer and softsynk-notify@.service to /etc/systemd/system and enables the timer",
+  "links /usr/local/bin/synk-backup when it is missing",
+]
+
+[platform]
+os = ["ubuntu"]
+min_version = "26.04"
+
+[operations]
+install   = ["setup-backup.sh"]
+configure = ["setup-backup.sh", "--configure"]
+status    = ["synk-backup", "--status-json"]
+
+[commands]
+synk-backup = "synk-backup"

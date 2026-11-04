@@ -1,0 +1,17 @@
+schema = 1
+id = "ubuntuonly"
+name = "Ubuntu only"
+description = "Ubuntu only fixture"
+version = "1.0.0"
+interface = 1
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[platform]
+os = ["ubuntu"]
+min_version = "24.04"
+
+[operations]
+install = ["run.sh", "install", "ok"]
+status = ["run.sh", "status", "healthy"]
+configure = ["run.sh", "configure"]

@@ -1,0 +1,13 @@
+schema = 1
+id = "cancelinstall"
+name = "Cancel install"
+description = "Cancel install fixture"
+version = "1.0.0"
+interface = 1
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "cancel"]
+status = ["run.sh", "status", "healthy"]
+configure = ["run.sh", "configure"]

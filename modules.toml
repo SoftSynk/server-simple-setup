@@ -1,0 +1,16 @@
+# Central module registry (schema 1). Order here is the display order and the
+# tie-break for dependency ordering. Each manifest is data-only; see
+# docs/module-development.md.
+schema = 1
+
+[[modules]]
+id = "backup"
+manifest = "deployment/backup/module.toml"
+
+[[modules]]
+id = "redis"
+manifest = "deployment/redis-setup/module.toml"
+
+[[modules]]
+id = "auto-updates"
+manifest = "deployment/auto-updates/module.toml"

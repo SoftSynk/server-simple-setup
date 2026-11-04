@@ -1,0 +1,14 @@
+schema = 1
+id = "bad-unknown-field"
+name = "x"
+description = "x fixture"
+version = "1.0.0"
+interface = 1
+privileges = ["root"]
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "ok"]
+status = ["run.sh", "status", "healthy"]
+configure = ["run.sh", "configure"]

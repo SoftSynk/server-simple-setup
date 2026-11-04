@@ -1,0 +1,6 @@
+[Unit]
+Description=softsynk failure notice for %i
+
+[Service]
+Type=oneshot
+ExecStart=@SYNK_BACKUP@ --root @ROOT@ notify --unit %i

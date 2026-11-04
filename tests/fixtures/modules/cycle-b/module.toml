@@ -1,0 +1,13 @@
+schema = 1
+id = "cycle-b"
+name = "x"
+description = "x fixture"
+version = "1.0.0"
+interface = 1
+requires = ["cycle-a"]
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["run.sh", "install", "ok"]
+status = ["run.sh", "status", "healthy"]
+configure = ["run.sh", "configure"]

@@ -1,0 +1,1753 @@
+#!/usr/bin/env python3
+"""synk-backup: PostgreSQL backups into a local restic repository, copied to an
+S3-compatible remote. Module "backup" of softsynk-server-management.
+
+Python 3 standard library only. Secrets never appear in argv, logs or status.
+See README.md in this folder for the operator guide.
+"""
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import secrets as pysecrets
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+VERSION = "1.0.0"
+SCHEMA = 1
+MODULE = "backup"
+HOST_TAG = "softsynk"                    # fixed restic host, so grouping never depends on the hostname
+MANAGED = "managed-by=softsynk-backup"
+TIERS = ("daily", "weekly", "twice_monthly")
+GLOBALS = "_globals"                     # pseudo-target: pg_dumpall --globals-only
+DB_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}$")
+RESTORE_PREFIX = "softsynk_restore_"     # scratch and leftover databases made by restore; never backed up
+OK, FAIL, PARTIAL, USAGE, BUSY = 0, 1, 2, 64, 75
+OVERDUE_HOURS = {"daily": 30, "weekly": 8 * 24, "twice_monthly": 17 * 24}
+STALE_HOURS = 36
+RESTORE_TEST_MAX_DAYS = 40
+LOG_KEEP_DAYS = 90
+PRESETS = {  # preset -> (endpoint pattern, region pattern)
+    "r2": ("https://{id}.r2.cloudflarestorage.com", "auto"),
+    "b2": ("https://s3.{id}.backblazeb2.com", "{id}"),
+    "hetzner": ("https://{id}.your-objectstorage.com", "{id}"),
+}
+DEFAULTS = {
+    "schema": SCHEMA,
+    "local_repo": "",
+    "remote": None,
+    "mail_to": "",
+    "retention": {"daily": 3, "weekly": 1, "twice_monthly": 2},
+    "compression": "auto",
+    "exclude_databases": [],
+    "pg": {"runas": "postgres", "bin_dir": "", "host": "", "port": ""},
+    "timeouts": {"dump": 7200, "restic": 21600},
+}
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=FAIL):
+        super().__init__(msg)
+        self.code = code
+
+
+class Interrupted(BaseException):
+    def __init__(self, sig):
+        super().__init__(sig)
+        self.sig = sig
+
+
+# ---------------------------------------------------------------- small helpers
+
+_SECRET_VALUES = set()
+_CHILDREN = set()
+
+
+def redact(s):
+    s = str(s)
+    for v in _SECRET_VALUES:
+        s = s.replace(v, "***")
+    return s
+
+
+def say(msg=""):
+    print(redact(msg), flush=True)
+
+
+def warn(msg):
+    print(redact(msg), file=sys.stderr, flush=True)
+
+
+def tail(s, n=1500):
+    s = (s or "").strip()
+    return s if len(s) <= n else "..." + s[-n:]
+
+
+def now():
+    """Local naive time. SYNK_BACKUP_NOW (naive local ISO) is a test-only clock."""
+    v = os.environ.get("SYNK_BACKUP_NOW")
+    return dt.datetime.fromisoformat(v) if v else dt.datetime.now().replace(microsecond=0)
+
+
+def iso(t):
+    return t.isoformat(timespec="seconds")
+
+
+def parse_iso(s):
+    try:
+        return dt.datetime.fromisoformat(s) if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def utc_iso(t):
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ago(t, ref):
+    h = (ref - t).total_seconds() / 3600
+    return f"{h:.0f}h ago" if h < 48 else f"{h / 24:.0f}d ago"
+
+
+def ensure_dir(path, mode=0o755):
+    os.makedirs(path, mode=mode, exist_ok=True)
+
+
+def write_atomic(path, data, mode):
+    ensure_dir(os.path.dirname(path))
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def write_if_changed(path, data, mode):
+    """Atomic write that touches nothing when content and mode already match."""
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as f:
+            if f.read() == data and stat.S_IMODE(st.st_mode) == mode:
+                return False
+    except FileNotFoundError:
+        pass
+    write_atomic(path, data, mode)
+    return True
+
+
+def nearest_existing(path):
+    p = os.path.abspath(path)
+    while not os.path.exists(p) and p != "/":
+        p = os.path.dirname(p)
+    return p
+
+
+def free_bytes(path):
+    return shutil.disk_usage(nearest_existing(path)).free
+
+
+def same_device(a, b):
+    return os.stat(nearest_existing(a)).st_dev == os.stat(nearest_existing(b)).st_dev
+
+
+def human(n):
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or u == "TiB":
+            return f"{n:.0f} {u}" if u == "B" else f"{n:.1f} {u}"
+        n /= 1024
+
+
+# ---------------------------------------------------------------- child processes
+
+class Res:
+    def __init__(self, rc, out="", err="", timed_out=False):
+        self.rc, self.out, self.err, self.timed_out = rc, out, err, timed_out
+
+    @property
+    def ok(self):
+        return self.rc == 0 and not self.timed_out
+
+    def why(self):
+        if self.timed_out:
+            return "timed out"
+        return tail(self.err) or f"exit {self.rc}"
+
+
+def _kill(p):
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(p.pid, signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        p.wait(timeout=5)
+
+
+def _on_signal(sig, _frame):
+    for p in list(_CHILDREN):
+        _kill(p)
+    raise Interrupted(sig)
+
+
+def run_cmd(argv, env=None, stdin=None, stdout=None, timeout=None):
+    """Run argv (never a shell) in its own process group; kill the group on timeout or signal."""
+    err = tempfile.TemporaryFile()
+    out = stdout if stdout is not None else tempfile.TemporaryFile()
+    try:
+        p = subprocess.Popen(argv, stdin=stdin if stdin is not None else subprocess.DEVNULL,
+                             stdout=out, stderr=err, env=env, cwd="/", start_new_session=True)
+    except OSError as e:
+        err.close()
+        if stdout is None:
+            out.close()
+        return Res(127, "", f"{argv[0]}: {e.strerror}")
+    _CHILDREN.add(p)
+    timed_out = False
+    try:
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    finally:
+        _CHILDREN.discard(p)
+        _kill(p)  # also reaps; kills stragglers in the group
+    err.seek(0)
+    e = err.read().decode("utf-8", "replace")
+    err.close()
+    o = ""
+    if stdout is None:
+        out.seek(0)
+        o = out.read().decode("utf-8", "replace")
+        out.close()
+    return Res(p.returncode, o, e, timed_out)
+
+
+# ---------------------------------------------------------------- context
+
+class Ctx:
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        j = lambda *p: os.path.join(self.root, *p)  # noqa: E731
+        self.etc, self.config_path = j("etc", "backup"), j("etc", "backup", "config.json")
+        self.sec_dir = j("secrets", "backup")
+        self.pass_path, self.s3_path = j("secrets", "backup", "restic.pass"), j("secrets", "backup", "s3.env")
+        self.state_path = j("state", "backup", "state.json")
+        self.lock_path = j("lock", "backup.lock")
+        self.tmp = j("tmp", "backup")
+        self.log_root = j("log", "backup")
+        self.default_repo = j("data", "backup", "restic")
+        self.cfg = None
+        self.pw = None            # repo password (env use during validation only)
+        self.use_pw_env = False
+        self.remote_down = False  # set for the rest of a run once the remote copy failed
+        self.s3 = {}              # AWS_* credentials
+        self.run_id = uuid.uuid4().hex[:8]
+        self.started = now()
+        self.logging = False
+        self._logfile = None
+
+    # --- logging: jsonl under log/backup/YY/MM/db-backup/
+    def log(self, event, **kw):
+        if not self.logging:
+            return
+        if self._logfile is None:
+            d = os.path.join(self.log_root, self.started.strftime("%y"), self.started.strftime("%m"), "db-backup")
+            ensure_dir(d)
+            self._logfile = os.path.join(d, f"{self.started.strftime('%Y%m%dT%H%M%S')}-{self.run_id}.jsonl")
+        rec = {"ts": iso(now()), "run": self.run_id, "event": event}
+        rec.update(kw)
+        fd = os.open(self._logfile, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+        with os.fdopen(fd, "a") as f:
+            f.write(redact(json.dumps(rec, sort_keys=True)) + "\n")
+
+    # --- secrets
+    def load_secrets(self):
+        try:
+            with open(self.pass_path) as f:
+                self.pw = f.read().strip("\r\n")
+        except OSError:
+            self.pw = None
+        self.s3 = read_env_file(self.s3_path)
+        self.register_secrets()
+
+    def register_secrets(self):
+        for v in [self.pw, *self.s3.values()]:
+            if v and len(v) >= 4:
+                _SECRET_VALUES.add(v)
+
+    def spec(self, which):
+        if which == "local":
+            return self.cfg["local_repo"]
+        return remote_spec(self.cfg)
+
+    def repos(self):
+        r = [("local", self.spec("local"))]
+        if self.cfg["remote"] and not self.remote_down:
+            r.append(("remote", self.spec("remote")))
+        return r
+
+
+def read_env_file(path):
+    out = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.rstrip("\r\n").partition("=")
+                if sep and k:
+                    out[k] = v
+    except OSError:
+        pass
+    return out
+
+
+def remote_spec(cfg):
+    r = cfg["remote"]
+    if not r:
+        return None
+    if r.get("repo"):
+        return r["repo"]
+    path = r["bucket"] + ("/" + r["prefix"] if r.get("prefix") else "")
+    return f"s3:{r['endpoint'].rstrip('/')}/{path}"
+
+
+# ---------------------------------------------------------------- config
+
+def _merge(base, over):
+    out = json.loads(json.dumps(base))
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k].update(v)
+        else:
+            out[k] = v
+    return out
+
+
+MAIL_RE = re.compile(r"^[^@\s,;<>]+@[^@\s,;<>]+$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+PREFIX_RE = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+IDENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+
+
+def check_endpoint(ep):
+    m = re.match(r"^(https?)://([A-Za-z0-9.-]+|\[[0-9a-f:]+\])(:\d{1,5})?$", ep or "")
+    if not m:
+        return "endpoint must look like https://host[:port] (no path)"
+    if m.group(1) == "http" and m.group(2) not in ("localhost", "127.0.0.1", "[::1]"):
+        return "plain http endpoints are only allowed for localhost"
+    return None
+
+
+def validate_cfg(cfg):
+    p = []
+    if cfg.get("schema") != SCHEMA:
+        p.append(f"schema must be {SCHEMA}")
+    if not (isinstance(cfg.get("local_repo"), str) and os.path.isabs(cfg["local_repo"])):
+        p.append("local_repo must be an absolute path")
+    r = cfg.get("remote")
+    if r is not None:
+        if not isinstance(r, dict):
+            p.append("remote must be an object or null")
+        elif r.get("repo"):
+            if not isinstance(r["repo"], str) or r["repo"].startswith("-"):
+                p.append("remote.repo is invalid")
+            elif re.search(r"://[^/?#]*@", r["repo"]):
+                p.append("remote.repo must not contain credentials (user:password@); "
+                         "set RESTIC_REST_USERNAME and RESTIC_REST_PASSWORD in the secrets file s3.env instead")
+        else:
+            e = check_endpoint(r.get("endpoint"))
+            if e:
+                p.append("remote." + e)
+            if not BUCKET_RE.match(str(r.get("bucket", ""))):
+                p.append("remote.bucket is not a valid bucket name")
+            if r.get("prefix") and (not PREFIX_RE.match(r["prefix"]) or ".." in r["prefix"]):
+                p.append("remote.prefix is invalid")
+            if not re.match(r"^[A-Za-z0-9-]{1,40}$", str(r.get("region", ""))):
+                p.append("remote.region is invalid")
+    if cfg.get("mail_to") and not MAIL_RE.match(cfg["mail_to"]):
+        p.append("mail_to is not an email address")
+    ret = cfg.get("retention", {})
+    for t in TIERS:
+        v = ret.get(t)
+        if type(v) is not int or not 1 <= v <= 365:
+            p.append(f"retention.{t} must be an integer from 1 to 365")
+    if cfg.get("compression") not in ("auto", "off", "fastest", "better", "max"):
+        p.append("compression must be auto, off, fastest, better or max")
+    ex = cfg.get("exclude_databases")
+    if not isinstance(ex, list) or not all(isinstance(x, str) and DB_RE.match(x) for x in ex):
+        p.append("exclude_databases must be a list of database names")
+    pg = cfg.get("pg", {})
+    if pg.get("runas") and not re.match(r"^[a-z_][a-z0-9_-]{0,31}$", pg["runas"]):
+        p.append("pg.runas is invalid")
+    if pg.get("bin_dir") and not os.path.isabs(pg["bin_dir"]):
+        p.append("pg.bin_dir must be an absolute path")
+    if pg.get("host") and not re.match(r"^[A-Za-z0-9_][A-Za-z0-9._:/-]*$", pg["host"]):
+        p.append("pg.host is invalid")
+    if pg.get("port") and not re.match(r"^\d{1,5}$", str(pg["port"])):
+        p.append("pg.port is invalid")
+    for k, v in cfg.get("timeouts", {}).items():
+        if type(v) is not int or v < 1:
+            p.append(f"timeouts.{k} must be a positive integer")
+    return p
+
+
+def load_config(ctx):
+    """Return the validated config dict, or None when not configured. Never writes."""
+    try:
+        with open(ctx.config_path) as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise Fail(f"cannot read {ctx.config_path}: {e}")
+    cfg = _merge(DEFAULTS, raw if isinstance(raw, dict) else {})
+    problems = validate_cfg(cfg)
+    if problems:
+        raise Fail("invalid config: " + "; ".join(problems), USAGE)
+    return cfg
+
+
+def need_config(ctx):
+    ctx.cfg = load_config(ctx)
+    if ctx.cfg is None:
+        raise Fail("not configured: run setup-backup.sh (or synk-backup configure)", USAGE)
+    ctx.load_secrets()
+    if not ctx.pw:
+        raise Fail(f"repository password missing: {ctx.pass_path}", USAGE)
+    if ctx.cfg["remote"] and not ctx.cfg["remote"].get("repo") and not (
+            ctx.s3.get("AWS_ACCESS_KEY_ID") and ctx.s3.get("AWS_SECRET_ACCESS_KEY")):
+        raise Fail(f"remote S3 credentials missing: {ctx.s3_path}", USAGE)
+
+
+# ---------------------------------------------------------------- restic
+
+def restic_env(ctx):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("RESTIC_", "AWS_"))}
+    if ctx.use_pw_env:
+        env["RESTIC_PASSWORD"] = ctx.pw
+    else:
+        env["RESTIC_PASSWORD_FILE"] = ctx.pass_path
+    env["RESTIC_COMPRESSION"] = (ctx.cfg or DEFAULTS)["compression"]
+    env["RESTIC_CACHE_DIR"] = os.path.join(ctx.tmp, "cache")
+    env.update(ctx.s3)
+    r = (ctx.cfg or {}).get("remote")
+    if r and r.get("region"):
+        env["AWS_DEFAULT_REGION"] = r["region"]
+    return env
+
+
+def restic(ctx, spec, args, ro=False, stdin=None, stdout=None, timeout=None, extra_env=None):
+    """ro=True: no cache dir, no repo lock (read-only commands that must not write anything)."""
+    argv = ["restic", "-r", spec, "--retry-lock", "10m"]
+    if ro:
+        argv += ["--no-cache", "--no-lock"]
+    env = restic_env(ctx)
+    env.update(extra_env or {})
+    return run_cmd(argv + list(args), env=env, stdin=stdin, stdout=stdout,
+                   timeout=timeout or ctx.cfg["timeouts"]["restic"])
+
+
+class Snap:
+    def __init__(self, d):
+        self.id = d["id"]
+        self.tags = {k: v for k, _, v in (t.partition("=") for t in d.get("tags") or [])}
+        m = re.match(r"^(.*?)(\.\d+)?([+-]\d\d:\d\d|Z)$", d["time"])
+        t = dt.datetime.fromisoformat(m.group(1) + (m.group(2) or "")[:7] + m.group(3).replace("Z", "+00:00"))
+        self.time = t.astimezone().replace(tzinfo=None)
+        self.kind = self.tags.get("kind", "")
+        self.tier = self.tags.get("tier", "")
+        self.target = GLOBALS if self.kind == "globals" else self.tags.get("db", "")
+
+    def as_dict(self):
+        return {"id": self.id, "time": iso(self.time), "kind": self.kind, "db": self.target, "tier": self.tier}
+
+
+def list_snaps(ctx, spec):
+    r = restic(ctx, spec, ["snapshots", "--json", "--tag", MANAGED], ro=True, timeout=300)
+    if not r.ok:
+        raise Fail(f"cannot list snapshots: {r.why()}")
+    try:
+        return [Snap(d) for d in json.loads(r.out or "[]")]
+    except (ValueError, KeyError) as e:
+        raise Fail(f"unreadable snapshot list: {e}")
+
+
+def period_key(tier, t):
+    if tier == "daily":
+        return (t.year, t.month, t.day)
+    if tier == "weekly":
+        c = t.isocalendar()
+        return (c[0], c[1])
+    return (t.year, t.month, 1 if t.day <= 14 else 2)
+
+
+def due_tiers(snaps, target, t):
+    have = {s.tier for s in snaps if s.target == target and period_key(s.tier, s.time) == period_key(s.tier, t)}
+    return [x for x in TIERS if x not in have]
+
+
+def plan_tiers(snaps, names, t):
+    """{target: tiers to snapshot}. Globals follow the databases (R8): they are saved whenever any database
+    has a tier due, for the union of those tiers, plus whatever globals themselves are missing."""
+    plan = {n: due_tiers(snaps, n, t) for n in names}
+    if GLOBALS in plan:
+        want = set(plan[GLOBALS]).union(*(v for n, v in plan.items() if n != GLOBALS))
+        plan[GLOBALS] = [x for x in TIERS if x in want]
+    return plan
+
+
+def globals_duplicates(snaps):
+    """Ids of globals snapshots superseded by a newer one of the same tier and period. Refreshing globals can
+    leave two in one period; keep-last counts snapshots, so the extras would eat the retention of older periods."""
+    seen, old = set(), []
+    for s in sorted((x for x in snaps if x.target == GLOBALS and x.tier in TIERS), key=lambda x: x.time, reverse=True):
+        k = (s.tier, period_key(s.tier, s.time))
+        if k in seen:
+            old.append(s.id)
+        seen.add(k)
+    return old
+
+
+# ---------------------------------------------------------------- postgres
+
+def pg_argv(cfg, tool, args, conn=True, runas=True):
+    pg = cfg["pg"]
+    argv = [os.path.join(pg["bin_dir"], tool) if pg["bin_dir"] else tool]
+    if conn and pg["host"]:
+        argv += ["-h", pg["host"]]
+    if conn and pg["port"]:
+        argv += ["-p", str(pg["port"])]
+    argv += args
+    if runas and pg["runas"]:
+        argv = ["runuser", "-u", pg["runas"], "--"] + argv
+    return argv
+
+
+def pg_major(version_line):
+    """Major version from 'pg_dump (PostgreSQL) 18.0 (Ubuntu 18.0-1.pgdg24.04+1)' and similar; None when absent."""
+    m = re.search(r"\(PostgreSQL\)\s*(\d+)", version_line or "")
+    return int(m.group(1)) if m else None
+
+
+def pg_env():
+    env = dict(os.environ)
+    env.setdefault("PGCONNECT_TIMEOUT", "15")
+    return env
+
+
+def psql(ctx, sql, db="postgres", timeout=120, zero=False):
+    args = ["-X", "-A", "-t", "-q", "-v", "ON_ERROR_STOP=1", "-d", db]
+    if zero:
+        args += ["-0", "-z"]
+    return run_cmd(pg_argv(ctx.cfg, "psql", args + ["-c", sql]), env=pg_env(), timeout=timeout)
+
+
+def discover(ctx):
+    """[(name, size)] of connectable non-template databases except 'postgres'."""
+    r = psql(ctx, "SELECT datname, pg_database_size(datname) FROM pg_database "
+                  "WHERE datallowconn AND NOT datistemplate AND datname <> 'postgres' ORDER BY datname", zero=True)
+    if not r.ok:
+        raise Fail(f"cannot list databases: {r.why()}")
+    parts = r.out.split("\0")
+    if parts and parts[-1] == "":
+        parts.pop()
+    if len(parts) % 2:
+        raise Fail("unexpected database list output")
+    return [(parts[i], int(parts[i + 1])) for i in range(0, len(parts), 2)]
+
+
+def conninfo(name):
+    return "dbname='" + name.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def dump_to(ctx, tool, args, path, timeout):
+    """Run a pg dump tool as the PG user; its stdout goes to a 0600 file we own (written by root)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        r = run_cmd(pg_argv(ctx.cfg, tool, args), env=pg_env(), stdout=fd, timeout=timeout)
+        size = os.fstat(fd).st_size
+    finally:
+        os.close(fd)
+    return r, size
+
+
+TOC_TABLE_RE = re.compile(r"^\d+; \d+ \d+ TABLE DATA ", re.M)
+
+
+def toc_tables(ctx, path):
+    """Readable-TOC check: returns (table_data_count, error)."""
+    with open(path, "rb") as f:
+        r = run_cmd(pg_argv(ctx.cfg, "pg_restore", ["--list"], conn=False, runas=False), env=pg_env(),
+                    stdin=f, timeout=600)
+    if not r.ok or not r.out.strip():
+        return None, f"pg_restore --list failed: {r.why()}"
+    return len(TOC_TABLE_RE.findall(r.out)), None
+
+
+TABLE_COUNT_SQL = (
+    "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind = 'r' AND c.relpersistence <> 't' "
+    "AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' "
+    "AND (NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass "
+    "AND d.objid = c.oid AND d.deptype = 'e') "
+    "OR c.oid IN (SELECT unnest(extconfig) FROM pg_extension WHERE extconfig IS NOT NULL))")
+
+
+def restore_into(ctx, path, newdb, expect_tables, owner=None):
+    """Create newdb, restore the dump, verify the table count. Raises Fail (dropping newdb) on any problem.
+    owner=None: scratch copy, every object owned by the restoring user (--no-owner).
+    owner=ROLE: ROLE owns the database and the dump's own owners are kept, so those roles must exist."""
+    r = psql(ctx, f'CREATE DATABASE "{newdb}" TEMPLATE template0' + (f' OWNER "{owner}"' if owner else ""))
+    if not r.ok:
+        raise Fail(f"cannot create database {newdb}: {r.why()}")
+    try:
+        with open(path, "rb") as f:
+            r = run_cmd(pg_argv(ctx.cfg, "pg_restore", ["--exit-on-error"] + ([] if owner else ["--no-owner"]) + ["-d", newdb]),
+                        env=pg_env(), stdin=f, timeout=ctx.cfg["timeouts"]["dump"])
+        if not r.ok:
+            hint = " (a role in the dump is missing: restore the globals first)" if owner and "does not exist" in r.err else ""
+            raise Fail(f"pg_restore failed{hint}: {r.why()}")
+        r = psql(ctx, TABLE_COUNT_SQL, db=newdb)
+        if not r.ok or not r.out.strip().isdigit():
+            raise Fail(f"cannot count restored tables: {r.why()}")
+        got = int(r.out.strip())
+        if got != expect_tables:
+            raise Fail(f"restored {got} tables, backup lists {expect_tables}")
+    except BaseException:
+        drop_db(ctx, newdb)
+        raise
+
+
+def drop_db(ctx, name):
+    r = psql(ctx, f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    if not r.ok:
+        warn(f"could not drop database {name}: {r.why()}")
+    return r.ok
+
+
+# ---------------------------------------------------------------- state
+
+def load_state(ctx):
+    try:
+        with open(ctx.state_path) as f:
+            s = json.load(f)
+        if not isinstance(s, dict):
+            s = {}
+    except (OSError, ValueError):
+        s = {}  # unreadable state is rebuilt from restic at the end of the next run
+    s.setdefault("schema", SCHEMA)
+    for k in ("targets", "prune"):
+        s.setdefault(k, {})
+    return s
+
+
+def save_state(ctx, state):
+    write_atomic(ctx.state_path, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode(), 0o644)
+
+
+def target(state, name, t):
+    e = state["targets"].setdefault(name, {})
+    e.setdefault("first_seen", iso(t))
+    return e
+
+
+def reconcile(state, snaps, t):
+    """Restic is the truth: rebuild every target's per-tier last success from the snapshot list."""
+    for e in state["targets"].values():
+        e["tiers"] = {}
+    for s in sorted(snaps, key=lambda x: x.time):
+        if not s.target or s.tier not in TIERS:
+            continue
+        e = target(state, s.target, t)
+        e.setdefault("tiers", {})[s.tier] = {"last_success": iso(s.time), "snapshot": s.id}
+    for name in [n for n, e in state["targets"].items() if not e.get("tiers") and not e.get("last_error")]:
+        del state["targets"][name]
+
+
+# ---------------------------------------------------------------- locking
+
+def take_lock(ctx):
+    """Non-blocking exclusive flock shared by run/check/restore/restore-test/configure. None when busy."""
+    ensure_dir(os.path.dirname(ctx.lock_path))
+    fd = os.open(ctx.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def locked(ctx):
+    fd = take_lock(ctx)
+    if fd is None:
+        raise Fail("another synk-backup operation is running (lock held)", BUSY)
+    return fd
+
+
+def clean_staging(ctx):
+    if os.path.isdir(ctx.tmp):
+        for n in os.listdir(ctx.tmp):
+            if n.startswith("run-"):
+                shutil.rmtree(os.path.join(ctx.tmp, n), ignore_errors=True)
+
+
+def new_stage(ctx):
+    ensure_dir(ctx.tmp, 0o700)
+    os.chmod(ctx.tmp, 0o700)
+    return tempfile.mkdtemp(prefix="run-", dir=ctx.tmp)  # 0700
+
+
+def cleanup_logs(ctx, t):
+    """Delete run logs older than 90 days; only regular files inside log/backup, never following symlinks."""
+    root = os.path.realpath(ctx.log_root)
+    if not os.path.isdir(root):
+        return
+    pat = re.compile(r"^(\d{8}T\d{6})-[0-9a-f]+\.jsonl$")
+    for dirpath, dirs, files in os.walk(root, followlinks=False, topdown=False):
+        if os.path.basename(dirpath) == "db-backup" and os.path.realpath(dirpath).startswith(root + os.sep):
+            for n in files:
+                m = pat.match(n)
+                full = os.path.join(dirpath, n)
+                if not m or os.path.islink(full):
+                    continue
+                if dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%S") < t - dt.timedelta(days=LOG_KEEP_DAYS):
+                    with contextlib.suppress(OSError):
+                        os.unlink(full)
+        if dirpath != root and not os.path.islink(dirpath):
+            with contextlib.suppress(OSError):
+                os.rmdir(dirpath)  # only succeeds when empty
+
+
+# ---------------------------------------------------------------- backup run
+
+def backup_tiers(ctx, path, kind, name, filename, tiers, when):
+    """One snapshot per due tier from the same file. Returns ({tier: id}, error)."""
+    done = {}
+    for tier in tiers:
+        tags = [MANAGED, f"kind={kind}"] + ([f"db={name}"] if kind == "db" else []) + [f"tier={tier}"]
+        with open(path, "rb") as f:
+            r = restic(ctx, ctx.spec("local"),
+                       ["backup", "--stdin", "--stdin-filename", filename, "--tag", ",".join(tags),
+                        "--host", HOST_TAG, "--time", when.strftime("%Y-%m-%d %H:%M:%S"), "--json"], stdin=f)
+        sid = None
+        for line in r.out.splitlines():
+            if line.startswith("{"):
+                with contextlib.suppress(ValueError):
+                    d = json.loads(line)
+                    if d.get("message_type") == "summary":
+                        sid = d.get("snapshot_id")
+        if not r.ok or not sid:
+            return done, f"restic backup ({tier}) failed: {r.why()}"
+        done[tier] = sid
+    return done, None
+
+
+def preflight_space(ctx, stage, size):
+    need = int(size * 1.2)
+    repo = ctx.cfg["local_repo"]
+    if same_device(stage, repo):
+        need *= 2
+    for label, p in (("staging", stage), ("local repository", repo)):
+        if free_bytes(p) < need:
+            return f"not enough free space for {label}: need about {human(need)}, have {human(free_bytes(p))}"
+    return None
+
+
+def run_target(ctx, state, stage, name, size, tiers, when):
+    """Dump one target (database or globals), verify, snapshot each due tier. Returns error or None."""
+    e = target(state, name, when)
+    path = os.path.join(stage, name + (".sql" if name == GLOBALS else ".dump"))
+    try:
+        if name == GLOBALS:
+            r, got = dump_to(ctx, "pg_dumpall", ["--globals-only"], path, ctx.cfg["timeouts"]["dump"])
+            if not r.ok or got == 0:
+                return f"pg_dumpall failed: {r.why()}"
+            with open(path, "rb") as f:
+                if b"PostgreSQL database cluster dump" not in f.read(4096):
+                    return "pg_dumpall output looks wrong"
+            fname, kind = "globals/globals.sql", "globals"
+        else:
+            err = preflight_space(ctx, stage, size)
+            if err:
+                return err
+            r, got = dump_to(ctx, "pg_dump", ["-Fc", "-Z0", "--lock-wait-timeout=5min", "--dbname=" + conninfo(name)],
+                             path, ctx.cfg["timeouts"]["dump"])
+            if not r.ok or got == 0:
+                return f"pg_dump failed: {r.why()}"
+            n, err = toc_tables(ctx, path)
+            if err:
+                return err
+            e["toc_tables"] = n
+            fname, kind = f"db/{name}.dump", "db"
+        e["dump_bytes"] = got
+        done, err = backup_tiers(ctx, path, kind, name, fname, tiers, when)
+        for tier, sid in done.items():
+            e.setdefault("tiers", {})[tier] = {"last_success": iso(when), "snapshot": sid}
+            ctx.log("snapshot", target=name, tier=tier, snapshot=sid)
+        return err
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
+def copy_remote(ctx):
+    r = restic(ctx, ctx.spec("remote"),
+               ["copy", "--from-repo", ctx.spec("local"), "--from-password-file", ctx.pass_path, "--tag", MANAGED])
+    return None if r.ok else f"restic copy failed: {r.why()}"
+
+
+def forget_old_globals(ctx, spec):
+    """Drop globals snapshots superseded within their period. Returns (forgot_any, error)."""
+    try:
+        old = globals_duplicates(list_snaps(ctx, spec))
+    except Fail as e:
+        return False, str(e)
+    if not old:
+        return False, None
+    r = restic(ctx, spec, ["forget", *old])
+    return r.ok, None if r.ok else r.why()
+
+
+def apply_retention(ctx, state, created, issues, t):
+    """forget per tier per repo (only when needed), then at most one prune per repo."""
+    want = ctx.cfg["retention"]
+    if not (created or state.get("retention_applied") != want or state.get("retention_failed")):
+        return
+    failed = ctx.remote_down  # the remote was skipped: retry it on the next run
+    for name, spec in ctx.repos():
+        pend = state["prune"].setdefault(name, {})
+        gone, gerr = forget_old_globals(ctx, spec)
+        if gerr:
+            failed = True
+            issues.append((name, f"forget superseded globals: {gerr}"))
+        if gone:
+            pend["pending"] = True
+        for tier in TIERS:
+            r = restic(ctx, spec, ["forget", "--json", "--group-by", "tags", "--keep-last", str(want[tier]),
+                                   "--host", HOST_TAG, "--tag", f"{MANAGED},tier={tier}"])
+            if not r.ok:
+                failed = True
+                issues.append((name, f"forget {tier}: {r.why()}"))
+                continue
+            try:
+                if any(g.get("remove") for g in json.loads(r.out or "null") or []):
+                    pend["pending"] = True
+            except ValueError:
+                failed = True
+                issues.append((name, f"forget {tier}: unreadable output"))
+        last = parse_iso(pend.get("last"))
+        weekly_ok = name == "local" or last is None or t - last >= dt.timedelta(days=7)
+        if pend.get("pending") and weekly_ok:
+            r = restic(ctx, spec, ["prune", "--max-unused", "5%"])
+            if r.ok:
+                pend["pending"], pend["last"] = False, iso(t)
+            else:
+                issues.append((name, f"prune: {r.why()}"))
+    state["retention_failed"] = failed
+    if not failed:
+        state["retention_applied"] = want
+
+
+def do_check(ctx, state, t):
+    ok, errs = True, []
+    for name, spec in ctx.repos():
+        r = restic(ctx, spec, ["check", "--read-data-subset=5%"])
+        if not r.ok:
+            ok = False
+            errs.append(redact(f"{name}: {r.why()}"))
+    state["check"] = {"last": iso(t), "ok": ok, "error": "; ".join(errs)}
+    ctx.log("check", ok=ok, error=state["check"]["error"])
+    return ok
+
+
+def data_dir_free(ctx):
+    r = psql(ctx, "SHOW data_directory")
+    p = r.out.strip() if r.ok else ""
+    return free_bytes(p) if p and os.path.isdir(p) else None
+
+
+def do_restore_test(ctx, state, t, snaps, which="local", only_db=None):
+    """Restore the newest snapshot of one database into a fresh throwaway database and verify it."""
+    spec = ctx.spec(which)
+    if spec is None:
+        raise Fail("no remote configured", USAGE)
+    snaps = snaps if which == "local" else list_snaps(ctx, spec)
+    newest = {}
+    for s in snaps:
+        if s.kind == "db" and (only_db is None or s.target == only_db) and (
+                s.target not in newest or s.time > newest[s.target].time):
+            newest[s.target] = s
+    if not newest:
+        state["restore_test"] = dict(state.get("restore_test") or {}, last=iso(t), ok=True, db=None,
+                                     error="", note="no database snapshots to test")
+        return True
+    db = only_db or min(newest, key=lambda n: state["targets"].get(n, {}).get("restore_tested") or "")
+    snap = newest[db]
+    rec = {"last": iso(t), "ok": False, "db": db, "snapshot": snap.id, "from": which, "error": "",
+           "last_success": (state.get("restore_test") or {}).get("last_success")}
+    stage = new_stage(ctx)
+    tmpdb = RESTORE_PREFIX + "test_" + uuid.uuid4().hex[:8]
+    try:
+        # disk preflight: staging copy and the throwaway database
+        size = state["targets"].get(db, {}).get("dump_bytes", 0)
+        if size and free_bytes(stage) < int(size * 1.2):
+            raise Fail("restore test skipped: not enough free space in staging")
+        path = os.path.join(stage, db + ".dump")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            r = restic(ctx, spec, ["dump", snap.id, f"/db/{db}.dump"], stdout=fd)
+            got = os.fstat(fd).st_size
+        finally:
+            os.close(fd)
+        if not r.ok or got == 0:
+            raise Fail(f"restic dump failed: {r.why()}")
+        dfree = data_dir_free(ctx)
+        if dfree is not None and dfree < int(got * 2):
+            raise Fail("restore test skipped: not enough free space for the test database")
+        n, err = toc_tables(ctx, path)
+        if err:
+            raise Fail(err)
+        restore_into(ctx, path, tmpdb, n)
+        rec["ok"], rec["last_success"], rec["tables"] = True, iso(t), n
+        state["targets"].setdefault(db, {})["restore_tested"] = iso(t)
+    except Fail as e:
+        rec["error"] = redact(str(e))
+    finally:
+        drop_db(ctx, tmpdb)
+        shutil.rmtree(stage, ignore_errors=True)
+    state["restore_test"] = rec
+    ctx.log("restore_test", **{k: v for k, v in rec.items() if k != "last_success"})
+    return rec["ok"]
+
+
+def cmd_run(ctx, a):
+    ctx.logging = not a.dry_run
+    need_config(ctx)
+    if a.db and not DB_RE.match(a.db):
+        raise Fail(f"invalid database name: {a.db!r}", USAGE)
+    if a.dry_run:
+        return run_dry(ctx, a)
+    fd = take_lock(ctx)
+    if fd is None:
+        say("synk-backup: already running")
+        return OK
+    t = ctx.started
+    state = load_state(ctx)
+    stage = None
+    result, error = "failed", ""
+    try:
+        clean_staging(ctx)
+        ensure_dir(os.path.dirname(ctx.state_path))
+        state["last_attempt"] = {"id": ctx.run_id, "started": iso(t), "result": "in_progress"}
+        save_state(ctx, state)
+        ctx.log("start", version=VERSION, only_db=a.db)
+        stage = new_stage(ctx)
+        result, error = do_run(ctx, state, stage, a, t)
+    except Fail as e:
+        error = str(e)
+        ctx.log("error", error=error)
+    except Interrupted as e:
+        error = f"interrupted by signal {e.sig}"
+        state["last_attempt"] = {"id": ctx.run_id, "started": iso(t), "finished": iso(now()),
+                                 "result": "failed", "error": error}
+        with contextlib.suppress(Exception):
+            save_state(ctx, state)
+        ctx.log("interrupted", signal=e.sig)
+        raise
+    finally:
+        if stage:
+            shutil.rmtree(stage, ignore_errors=True)
+    state["last_attempt"] = {"id": ctx.run_id, "started": iso(t), "finished": iso(now()),
+                             "result": result, "error": redact(error)}
+    if result == "success":
+        state["last_success"] = iso(now())
+    save_state(ctx, state)
+    ctx.log("finish", result=result, error=error)
+    with contextlib.suppress(OSError):
+        cleanup_logs(ctx, now())
+    say(f"synk-backup: run {result}" + (f": {error}" if error else ""))
+    return {"success": OK, "partial": PARTIAL}.get(result, FAIL)
+
+
+def select_targets(ctx, a):
+    """Discover databases; returns (targets [(name,size)], failures {name: error})."""
+    found = discover(ctx)
+    excluded = set(ctx.cfg["exclude_databases"])
+    targets, bad = [], {}
+    for name, size in found:
+        if name in excluded or name.startswith(RESTORE_PREFIX) or (a.db and name != a.db):
+            continue
+        if not DB_RE.match(name):
+            bad[ascii(name)] = "unsafe database name, skipped"
+            continue
+        targets.append((name, size))
+    if a.db and not any(n == a.db for n, _ in targets):
+        raise Fail(f"database not found or excluded: {a.db}", USAGE)
+    return targets, bad
+
+
+def run_dry(ctx, a):
+    snaps = list_snaps(ctx, ctx.spec("local"))
+    targets, bad = select_targets(ctx, a)
+    t = now()
+    say(f"dry run at {iso(t)}: nothing will be written")
+    work = targets + ([] if a.db else [(GLOBALS, 0)])
+    plan = plan_tiers(snaps, [n for n, _ in work], t)
+    for name, size in work:
+        due = plan[name]
+        say(f"  {name}: " + (f"dump (~{human(size)}), snapshot tiers {', '.join(due)}" if due else "up to date"))
+    for n, why in bad.items():
+        say(f"  {n}: {why}")
+    say("  then: copy to remote" if ctx.cfg["remote"] else "  no remote configured")
+    return OK
+
+
+def do_run(ctx, state, stage, a, t):
+    """Returns (result, error). Mutates state."""
+    issues = []  # (where, message)
+    for name, spec in ctx.repos():
+        restic(ctx, spec, ["unlock"], timeout=300)  # removes stale locks only
+    try:
+        targets, bad = select_targets(ctx, a)
+        snaps = list_snaps(ctx, ctx.spec("local"))
+    except Fail as e:
+        return "failed", str(e)
+    for e in state["targets"].values():
+        e["present"] = False
+    n_ok = n_fail = created = 0
+    work = list(targets) + ([] if a.db else [(GLOBALS, 0)])
+    plan = plan_tiers(snaps, [n for n, _ in work], t)
+    for name, why in bad.items():
+        e = target(state, name, t)
+        e.update(last_error=why, last_attempt=iso(t), status="failed", present=True)
+        e["attempts"] = e.get("attempts", 0) + 1
+        ctx.log("target_failed", target=name, error=why)
+        n_fail += 1
+    for name, size in work:
+        e = target(state, name, t)
+        e["present"] = True
+        e["last_attempt"] = iso(t)
+        tiers = plan[name]
+        if not tiers:
+            e.update(status="up_to_date", last_error="", attempts=0)
+            n_ok += 1
+            continue
+        err = run_target(ctx, state, stage, name, size, tiers, t)
+        e["attempts"] = e.get("attempts", 0) + 1
+        if err:
+            e.update(status="failed", last_error=redact(err))
+            ctx.log("target_failed", target=name, error=err)
+            say(f"synk-backup: {name}: FAILED: {tail(redact(err), 300)}")
+            n_fail += 1
+        else:
+            e.update(status="ok", last_error="", attempts=0)
+            e["pg_dump_version"] = e.get("pg_dump_version") or pg_version_line(ctx)
+            created += len(tiers)
+            n_ok += 1
+            say(f"synk-backup: {name}: saved tiers {', '.join(tiers)}")
+    if ctx.cfg["remote"]:
+        err = copy_remote(ctx)
+        state["remote"] = {"last_copy": iso(t) if not err else (state.get("remote") or {}).get("last_copy"),
+                           "ok": not err, "error": redact(err or "")}
+        if err:
+            issues.append(("remote", err))
+            ctx.log("copy_failed", error=err)
+            ctx.remote_down = True  # do not spend more timeouts on forget/prune/check against it this run
+    apply_retention(ctx, state, created, issues, t)
+    if not a.db:
+        chk = parse_iso((state.get("check") or {}).get("last"))
+        if chk is None or t - chk >= dt.timedelta(days=7):
+            if not do_check(ctx, state, t):
+                issues.append(("check", state["check"]["error"]))
+        rt = parse_iso((state.get("restore_test") or {}).get("last"))
+        if rt is None or t - rt >= dt.timedelta(days=30):
+            try:
+                snaps = list_snaps(ctx, ctx.spec("local"))
+            except Fail:
+                pass
+            if not do_restore_test(ctx, state, t, snaps):
+                issues.append(("restore_test", state["restore_test"]["error"]))
+    with contextlib.suppress(Fail):
+        reconcile(state, list_snaps(ctx, ctx.spec("local")), t)
+    state["config_mail"] = bool(ctx.cfg["mail_to"])
+    msgs = [f"{n}: {m}" for n, m in issues]
+    msgs += [f"{n}: {e.get('last_error')}" for n, e in state["targets"].items()
+             if e.get("status") == "failed" and e.get("last_attempt") == iso(t)]
+    if not msgs:
+        return "success", ""
+    if n_fail and not n_ok:
+        return "failed", "; ".join(msgs)
+    return "partial", "; ".join(msgs)
+
+
+def pg_version_line(ctx):
+    r = run_cmd(pg_argv(ctx.cfg, "pg_dump", ["--version"], conn=False, runas=False), env=pg_env(), timeout=30)
+    return r.out.strip() if r.ok else ""
+
+
+# ---------------------------------------------------------------- other commands
+
+def cmd_check(ctx, a):
+    ctx.logging = True
+    need_config(ctx)
+    fd = locked(ctx)  # noqa: F841 (held until exit)
+    ensure_dir(ctx.tmp, 0o700)
+    state = load_state(ctx)
+    ok = do_check(ctx, state, now())
+    save_state(ctx, state)
+    say("check " + ("passed" if ok else "FAILED: " + state["check"]["error"]))
+    return OK if ok else FAIL
+
+
+def cmd_restore_test(ctx, a):
+    ctx.logging = True
+    need_config(ctx)
+    if a.db and not DB_RE.match(a.db):
+        raise Fail(f"invalid database name: {a.db!r}", USAGE)
+    fd = locked(ctx)  # noqa: F841
+    state = load_state(ctx)
+    snaps = list_snaps(ctx, ctx.spec("local")) if a.source == "local" else []
+    ok = do_restore_test(ctx, state, now(), snaps, a.source, a.db)
+    save_state(ctx, state)
+    rt = state["restore_test"]
+    say(f"restore test {'passed' if ok else 'FAILED'}: database {rt.get('db')}"
+        + (f": {rt['error']}" if rt.get("error") else ""))
+    return OK if ok else FAIL
+
+
+def pick_snapshot(snaps, db, want):
+    cands = [s for s in snaps if s.target == db]
+    if want != "latest":
+        cands = [s for s in cands if s.id == want or s.id.startswith(want)]
+        if len(cands) != 1:
+            raise Fail(f"snapshot {want} is not a unique snapshot of {db}", USAGE)
+        return cands[0]
+    if not cands:
+        raise Fail(f"no snapshots found for {db}", USAGE)
+    return max(cands, key=lambda s: s.time)
+
+
+def confirm_danger(a, target_name):
+    typed = a.confirm_restore
+    if typed is None:
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):
+            raise Fail(f"refusing to replace {target_name}: pass --confirm-restore={target_name}", USAGE)
+        try:
+            typed = input(f"This REPLACES database '{target_name}'. Type its name to continue: ")
+        except (EOFError, KeyboardInterrupt):
+            raise SystemExit(130)
+    if typed != target_name:
+        raise Fail("confirmation does not match; nothing was changed", USAGE if a.confirm_restore else FAIL)
+
+
+def cmd_restore(ctx, a):
+    ctx.logging = True
+    need_config(ctx)
+    modes = [bool(a.to_db), bool(a.to_file), a.replace_existing]
+    if sum(modes) != 1 or bool(a.db) == bool(a.globals):
+        raise Fail("use exactly one of --db NAME or --globals, and exactly one of --to-db, --to-file, --replace-existing", USAGE)
+    if a.globals and not a.to_file:
+        raise Fail("--globals needs --to-file", USAGE)
+    for n in (a.db, a.to_db):
+        if n and not DB_RE.match(n):
+            raise Fail(f"invalid database name: {n!r}", USAGE)
+    if a.to_db and a.to_db.startswith(RESTORE_PREFIX):
+        raise Fail("reserved database name", USAGE)
+    if a.source == "remote" and not ctx.cfg["remote"]:
+        raise Fail("no remote configured", USAGE)
+    name = GLOBALS if a.globals else a.db
+    if a.replace_existing:
+        confirm_danger(a, name)
+    fd = locked(ctx)  # noqa: F841
+    spec = ctx.spec(a.source)
+    snap = pick_snapshot(list_snaps(ctx, spec), name, a.snapshot)
+    fname = "/globals/globals.sql" if a.globals else f"/db/{name}.dump"
+    ensure_dir(ctx.tmp, 0o700)
+    stage = new_stage(ctx)
+    try:
+        if a.to_file:
+            dest = os.path.abspath(a.to_file)
+            try:
+                out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except OSError as e:
+                raise Fail(f"cannot create {dest}: {e.strerror}", USAGE)
+            try:
+                r = restic(ctx, spec, ["dump", snap.id, fname], stdout=out)
+                if not r.ok:
+                    raise Fail(f"restic dump failed: {r.why()}")
+            except BaseException:  # failure, SIGTERM or Ctrl-C: never leave a partial restore behind
+                with contextlib.suppress(OSError):
+                    os.unlink(dest)
+                raise
+            finally:
+                os.close(out)
+            say(f"restored snapshot {snap.id[:8]} ({iso(snap.time)}) to {dest}")
+            return OK
+        path = os.path.join(stage, name + ".dump")
+        out = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            r = restic(ctx, spec, ["dump", snap.id, fname], stdout=out)
+        finally:
+            os.close(out)
+        if not r.ok:
+            raise Fail(f"restic dump failed: {r.why()}")
+        n, err = toc_tables(ctx, path)
+        if err:
+            raise Fail(err)
+        if a.to_db:
+            r = psql(ctx, f"SELECT 1 FROM pg_database WHERE datname = '{a.to_db}'")
+            if not r.ok or r.out.strip():
+                raise Fail(f"database {a.to_db} already exists or cannot be checked", USAGE)
+            restore_into(ctx, path, a.to_db, n)
+            say(f"restored snapshot {snap.id[:8]} ({iso(snap.time)}) into new database {a.to_db}")
+            return OK
+        return replace_existing(ctx, name, path, n, snap)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+
+def old_db_name(db, t=None):
+    """softsynk_restore_old_<db>_<UTC stamp>, shortening <db> so the name fits PostgreSQL's 63-byte limit."""
+    stamp = (t or dt.datetime.now(dt.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    head = RESTORE_PREFIX + "old_"
+    return f"{head}{db[:63 - len(head) - len(stamp) - 1]}_{stamp}"
+
+
+def replace_existing(ctx, name, path, n, snap):
+    r = psql(ctx, f"SELECT count(*) FROM pg_stat_activity WHERE datname = '{name}' AND pid <> pg_backend_pid()")
+    if not r.ok:
+        raise Fail(f"cannot check connections: {r.why()}")
+    if int(r.out.strip() or 0):
+        raise Fail(f"{name} has active connections; stop the application first", USAGE)
+    r = psql(ctx, f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{name}'")
+    owner = r.out.strip()
+    if not r.ok or not owner:
+        raise Fail(f"database {name} does not exist or cannot be checked; use --to-db for a new database", USAGE)
+    tmp, old = RESTORE_PREFIX + "tmp_" + uuid.uuid4().hex[:8], old_db_name(name)
+    restore_into(ctx, path, tmp, n, owner=owner.replace('"', '""'))  # fails here, before any swap, if a role is missing
+    for sql in (f'ALTER DATABASE "{name}" RENAME TO "{old}"', f'ALTER DATABASE "{tmp}" RENAME TO "{name}"'):
+        r = psql(ctx, sql)
+        if not r.ok:
+            psql(ctx, f'ALTER DATABASE "{old}" RENAME TO "{name}"')  # best effort rollback
+            drop_db(ctx, tmp)
+            raise Fail(f"rename failed, original kept: {r.why()}")
+    say(f"replaced database {name} with snapshot {snap.id[:8]} ({iso(snap.time)})")
+    say(f"the previous database was kept as {old} and still uses disk space. When the result is checked, drop it with:")
+    say("  " + shlex.join(pg_argv(ctx.cfg, "psql", ["-d", "postgres", "-c", f'DROP DATABASE "{old}"'])))
+    return OK
+
+
+def cmd_snapshots(ctx, a):
+    need_config(ctx)
+    which = a.source
+    if which == "remote" and not ctx.cfg["remote"]:
+        raise Fail("no remote configured", USAGE)
+    snaps = sorted(list_snaps(ctx, ctx.spec(which)), key=lambda s: s.time)
+    if a.json:
+        say(json.dumps([s.as_dict() for s in snaps], indent=2))
+    else:
+        for s in snaps:
+            say(f"{s.id[:8]}  {iso(s.time)}  {s.kind:8} {s.target:24} {s.tier}")
+        say(f"{len(snaps)} snapshot(s) in {which} repository")
+    return OK
+
+
+def tool_version(ctx, tool, runas=False):
+    pg = tool.startswith(("pg_", "psql"))
+    argv = pg_argv(ctx.cfg or DEFAULTS, tool, ["--version"], conn=False, runas=False) if pg else [tool, "version"]
+    r = run_cmd(argv, env=pg_env(), timeout=30)
+    return r.out.strip().splitlines()[0] if r.ok and r.out.strip() else None
+
+
+def validate_all(ctx, cfg, report):
+    """Read-only checks. report(level, name, msg) with level ok|warn|fail."""
+    ctx.cfg = cfg
+    for tool in ("restic", "psql", "pg_dump", "pg_dumpall", "pg_restore"):
+        v = tool_version(ctx, tool)
+        report("ok" if v else "fail", f"tool {tool}", v or "not found in PATH" + (
+            "" if tool == "restic" else " / pg.bin_dir"))
+    m = re.search(r"restic (\d+)\.(\d+)(?:\.(\d+))?", tool_version(ctx, "restic") or "")
+    if m and tuple(int(x or 0) for x in m.groups()) < (0, 17, 1):
+        # exit codes 10 (no repository) and 12 (wrong password) arrived in 0.17.1; --retry-lock in 0.16
+        report("fail", "restic version", "restic 0.17.1 or newer is required (repository exit codes 10 and 12)")
+    if cfg["pg"]["runas"] and not shutil.which("runuser"):
+        report("fail", "tool runuser", "not found")
+    sizes = []
+    try:
+        r = psql(ctx, "SELECT current_setting('server_version_num')")
+        if not r.ok:
+            raise Fail(r.why())
+        major = int(r.out.strip()) // 10000
+        sizes = discover(ctx)
+        report("ok", "postgres", f"connected as {cfg['pg']['runas'] or 'current user'}, server major {major}, "
+                                 f"{len(sizes)} database(s)")
+        dv = pg_major(tool_version(ctx, "pg_dump"))
+        if dv and dv < major:
+            report("fail", "pg_dump version", f"pg_dump {dv} is older than server {major}")
+    except Fail as e:
+        report("fail", "postgres", f"cannot connect: {e}")
+    need = int(max([s for _, s in sizes] or [0]) * 1.2)
+    for label, p in (("staging", ctx.tmp), ("local repository", cfg["local_repo"])):
+        anc = nearest_existing(p)
+        if not os.access(anc, os.W_OK):
+            report("fail", f"{label} path", f"{anc} is not writable")
+        elif free_bytes(p) < max(need, 1 << 20):
+            report("fail", f"{label} space", f"free {human(free_bytes(p))}, need about {human(need)}")
+        else:
+            report("ok", f"{label} space", f"{human(free_bytes(p))} free")
+    states = {}
+    for name, spec in ctx.repos():
+        r = restic(ctx, spec, ["cat", "config"], ro=True, timeout=120)
+        if r.rc == 0:
+            states[name] = "exists"
+            report("ok", f"{name} repository", "reachable, password accepted")
+        elif r.rc == 10:
+            states[name] = "missing"
+            report("ok", f"{name} repository", "does not exist yet; will be created")
+        elif r.rc == 12:
+            states[name] = "wrong-password"
+            report("fail", f"{name} repository", "wrong password; refusing to continue (never initialises over it)")
+        else:
+            states[name] = "error"
+            report("fail", f"{name} repository", r.why())
+    if cfg["mail_to"] and not (shutil.which("sendmail") or os.path.exists("/usr/sbin/sendmail")):
+        report("warn", "mail", "no sendmail found; failure mails cannot be sent")
+    return states
+
+
+def cmd_validate(ctx, a):
+    need_config(ctx)
+    bad = []
+
+    def report(level, name, msg):
+        say(f"{level.upper():4} {name}: {msg}")
+        if level == "fail":
+            bad.append(name)
+
+    validate_all(ctx, ctx.cfg, report)
+    say("valid" if not bad else f"{len(bad)} problem(s) found")
+    return OK if not bad else FAIL
+
+
+def cmd_configure(ctx, a):
+    old = load_config(ctx)
+    cfg = _merge(DEFAULTS, old or {})
+    if not cfg["local_repo"]:
+        cfg["local_repo"] = ctx.default_repo
+    if a.local_repo:
+        cfg["local_repo"] = a.local_repo
+    if a.remote_preset == "none":
+        cfg["remote"] = None
+    elif a.remote_preset or a.remote_repo:
+        cfg["remote"] = build_remote(a, cfg["remote"])
+    elif cfg["remote"]:
+        for k in ("bucket", "prefix", "endpoint", "region"):
+            v = getattr(a, "remote_" + k)
+            if v is not None:
+                cfg["remote"][k] = v
+    if a.mail_to is not None:
+        cfg["mail_to"] = a.mail_to
+    for t in TIERS:
+        v = getattr(a, "retention_" + t)
+        if v is not None:
+            cfg["retention"][t] = v
+    if a.compression:
+        cfg["compression"] = a.compression
+    if a.exclude_databases is not None:
+        cfg["exclude_databases"] = [x for x in a.exclude_databases.split(",") if x]
+    for k in ("runas", "bin_dir", "host", "port"):
+        v = getattr(a, "pg_" + k)
+        if v is not None:
+            cfg["pg"][k] = v
+    problems = validate_cfg(cfg)
+    if problems:
+        raise Fail("invalid settings: " + "; ".join(problems), USAGE)
+
+    secrets_in = {}
+    if a.secrets_stdin:
+        try:
+            secrets_in = json.load(sys.stdin)
+        except ValueError:
+            raise Fail("--secrets-stdin: input is not valid JSON", USAGE)
+        if not isinstance(secrets_in, dict) or set(secrets_in) - {"restic_password", "s3_access_key_id", "s3_secret_access_key"}:
+            raise Fail("--secrets-stdin: unexpected keys", USAGE)
+        for k, v in secrets_in.items():
+            if not isinstance(v, str) or not re.match(r"^[\x21-\x7e]{4,256}$", v):
+                raise Fail(f"--secrets-stdin: {k} must be 4-256 printable characters without spaces", USAGE)
+    ctx.load_secrets()
+    old_pw = ctx.pw
+    new_pw = secrets_in.get("restic_password")
+    if old_pw and new_pw and new_pw != old_pw:
+        raise Fail("refusing to change the repository password: existing repositories are encrypted with it", USAGE)
+    pw = old_pw or new_pw
+    if not pw:
+        raise Fail("no repository password: provide restic_password with --secrets-stdin (see: synk-backup genpass)", USAGE)
+    if len(pw) < 12:
+        raise Fail("the repository password must be at least 12 characters", USAGE)
+    s3 = dict(ctx.s3)
+    if secrets_in.get("s3_access_key_id"):
+        s3["AWS_ACCESS_KEY_ID"] = secrets_in["s3_access_key_id"]
+    if secrets_in.get("s3_secret_access_key"):
+        s3["AWS_SECRET_ACCESS_KEY"] = secrets_in["s3_secret_access_key"]
+    needs_s3 = cfg["remote"] and not cfg["remote"].get("repo")
+    if needs_s3 and not (s3.get("AWS_ACCESS_KEY_ID") and s3.get("AWS_SECRET_ACCESS_KEY")):
+        raise Fail("the remote needs S3 credentials: provide s3_access_key_id and s3_secret_access_key", USAGE)
+    ctx.pw, ctx.s3, ctx.use_pw_env = pw, {k: v for k, v in s3.items() if k.startswith("AWS_")}, True
+    ctx.register_secrets()
+
+    fd = locked(ctx)  # noqa: F841
+    bad = []
+
+    def report(level, name, msg):
+        say(f"{level.upper():4} {name}: {msg}")
+        if level == "fail":
+            bad.append(name)
+
+    states = validate_all(ctx, cfg, report)
+    if bad:
+        say(f"{len(bad)} problem(s) found; nothing was changed")
+        return FAIL
+    if a.dry_run:
+        say("dry run: validation passed; nothing was changed")
+        return OK
+    changed = []
+    ensure_dir(ctx.etc)
+    ensure_dir(ctx.sec_dir, 0o700)
+    for d in (os.path.dirname(ctx.state_path), os.path.dirname(ctx.lock_path), ctx.log_root):
+        ensure_dir(d)
+    ensure_dir(ctx.tmp, 0o700)
+    if write_if_changed(ctx.pass_path, (pw + "\n").encode(), 0o600):
+        changed.append("repository password file")
+    if needs_s3:
+        body = "".join(f"{k}={s3[k]}\n" for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"))
+        if write_if_changed(ctx.s3_path, body.encode(), 0o600):
+            changed.append("S3 credentials")
+    ctx.cfg = cfg
+    ctx.use_pw_env = False  # secrets are on disk now
+    for name, spec in ctx.repos():
+        if states.get(name) != "missing":
+            continue
+        args = ["init"] if name == "local" else [
+            "init", "--from-repo", ctx.spec("local"), "--from-password-file", ctx.pass_path, "--copy-chunker-params"]
+        r = restic(ctx, spec, args, timeout=300)
+        if not r.ok:
+            raise Fail(f"cannot initialise the {name} repository: {r.why()}")
+        changed.append(f"{name} repository created")
+    if write_if_changed(ctx.config_path, (json.dumps(cfg, indent=2, sort_keys=True) + "\n").encode(), 0o644):
+        changed.append("config")
+    say("configured: " + (", ".join(changed) if changed else "nothing changed"))
+    return OK
+
+
+def build_remote(a, current):
+    if a.remote_repo:
+        return {"preset": "custom", "repo": a.remote_repo}
+    r = dict(current or {})
+    r.pop("repo", None)
+    preset = a.remote_preset or r.get("preset")
+    if preset in PRESETS:
+        ident = a.remote_id
+        if not ident or not IDENT_RE.match(ident):
+            raise Fail(f"preset {preset} needs --remote-id (account id or region)", USAGE)
+        ep, region = PRESETS[preset]
+        r["endpoint"], r["region"] = ep.format(id=ident), region.format(id=ident)
+    elif preset == "custom":
+        r["endpoint"] = a.remote_endpoint or r.get("endpoint")
+        r["region"] = a.remote_region or r.get("region") or "us-east-1"
+    else:
+        raise Fail(f"unknown remote preset {preset!r}", USAGE)
+    if a.remote_region:
+        r["region"] = a.remote_region
+    r["preset"] = preset
+    if a.remote_bucket is not None:
+        r["bucket"] = a.remote_bucket
+    if a.remote_prefix is not None:
+        r["prefix"] = a.remote_prefix.strip("/")
+    r.setdefault("prefix", "")
+    return r
+
+
+def cmd_config(ctx, a):
+    cfg = load_config(ctx)
+    ctx.load_secrets()
+    host = re.sub(r"[^A-Za-z0-9._-]", "-", socket.gethostname().split(".")[0]) or "server"
+    say(json.dumps({"configured": cfg is not None, "config": cfg or _merge(DEFAULTS, {"local_repo": ctx.default_repo}),
+                    "has_password": bool(ctx.pw),
+                    "has_s3_keys": bool(ctx.s3.get("AWS_ACCESS_KEY_ID") and ctx.s3.get("AWS_SECRET_ACCESS_KEY")),
+                    "defaults": {"local_repo": ctx.default_repo, "prefix": "softsynk-" + host},
+                    "presets": sorted(PRESETS) + ["custom"]}, indent=2, sort_keys=True))
+    return OK
+
+
+def cmd_genpass(ctx, a):
+    say(pysecrets.token_urlsafe(24))
+    return OK
+
+
+def cmd_notify(ctx, a):
+    if not re.match(r"^[A-Za-z0-9@._:-]{1,128}$", a.unit):
+        raise Fail("invalid unit name", USAGE)
+    cfg = load_config(ctx)
+    if not cfg or not cfg["mail_to"]:
+        say("no mail_to configured; not sending")
+        return OK
+    ctx.cfg = cfg
+    ctx.load_secrets()
+    doc = build_status(ctx)
+    host = socket.gethostname()
+    body = (f"To: {cfg['mail_to']}\nSubject: [softsynk] {a.unit} failed on {host}\n"
+            "Content-Type: text/plain; charset=utf-8\n\n"
+            f"Unit {a.unit} failed on {host} at {iso(now())}.\n\nBackup status: {doc['summary']}\n"
+            + "".join(f"  - {w}\n" for w in doc["warnings"])
+            + "\nInvestigate: synk-backup --status ; journalctl -u softsynk-backup.service\n")
+    sendmail = shutil.which("sendmail") or "/usr/sbin/sendmail"
+    r = run_cmd([sendmail, "-t", "-i"], stdin=_text_file(redact(body)), timeout=60)
+    if not r.ok:
+        raise Fail(f"sendmail failed: {r.why()}")
+    return OK
+
+
+def _text_file(s):
+    f = tempfile.TemporaryFile()
+    f.write(s.encode())
+    f.seek(0)
+    return f
+
+
+# ---------------------------------------------------------------- status (read-only, no lock, no restic)
+
+def timer_info():
+    if not shutil.which("systemctl"):
+        return None
+    r = run_cmd(["systemctl", "show", "softsynk-backup.timer", "-p", "ActiveState", "-p", "UnitFileState",
+                 "-p", "NextElapseUSecRealtime", "-p", "LastTriggerUSec"], timeout=3)
+    if not r.ok:
+        return None
+    return dict(line.split("=", 1) for line in r.out.splitlines() if "=" in line)
+
+
+def build_status(ctx):
+    t = now()
+    doc = {"schema": SCHEMA, "module": MODULE, "version": VERSION, "observed_at": utc_iso(t),
+           "install_state": "installed", "health": "unknown", "summary": "", "details": {}, "warnings": [], "actions": []}
+    try:
+        cfg = load_config(ctx)
+    except Fail as e:
+        doc.update(health="unhealthy", summary="configuration unreadable")
+        doc["warnings"].append(str(e))
+        doc["actions"].append("fix etc/backup/config.json or re-run setup-backup.sh")
+        return doc
+    if cfg is None:
+        doc.update(install_state="not_installed", summary="not installed")
+        doc["actions"].append("run setup-backup.sh")
+        return doc
+    ctx.cfg = cfg
+    state = load_state(ctx)
+    warns, bad, soft = doc["warnings"], [], []
+    d = doc["details"]
+    last = state.get("last_attempt") or {}
+    started, finished = parse_iso(last.get("started")), parse_iso(last.get("finished"))
+    d["last_run"] = {k: last.get(k) for k in ("id", "started", "finished", "result", "error")}
+    d["schedule"] = timer_info()
+    d["retention"] = cfg["retention"]
+    d["local"] = {"location": cfg["local_repo"], "off_server": False,
+                  "free_bytes": free_bytes(cfg["local_repo"]) if os.path.isdir(nearest_existing(cfg["local_repo"])) else None}
+    r = cfg["remote"]
+    rs = state.get("remote") or {}
+    d["remote"] = None if not r else {
+        "off_server": True, "preset": r.get("preset"), "bucket": r.get("bucket"), "prefix": r.get("prefix"),
+        "endpoint": re.sub(r"^https?://", "", r.get("endpoint", "")) or None,
+        "last_copy": rs.get("last_copy"), "ok": rs.get("ok"), "error": rs.get("error", "")}
+    d["check"], d["restore_test"] = state.get("check"), {
+        k: v for k, v in (state.get("restore_test") or {}).items() if k != "snapshot"} or None
+    dbs, overdue = {}, []
+    for name, e in sorted(state["targets"].items()):
+        tiers = {tier: (e.get("tiers") or {}).get(tier, {}).get("last_success") for tier in TIERS}
+        dbs[name] = {"status": e.get("status", "unknown"), "last_success": tiers, "last_error": e.get("last_error", ""),
+                     "dump_bytes": e.get("dump_bytes"), "consecutive_failures": e.get("attempts", 0)}
+        if e.get("present", True):
+            for tier in TIERS:
+                ts = parse_iso(tiers[tier]) or parse_iso(e.get("first_seen"))
+                if ts and (t - ts).total_seconds() / 3600 > OVERDUE_HOURS[tier]:
+                    overdue.append(f"{name}/{tier}")
+        if e.get("status") == "failed":
+            bad.append(f"{name}: {e.get('last_error') or 'backup failed'}")
+    d["databases"], d["overdue"] = dbs, overdue
+    for item in overdue:
+        bad.append(f"overdue: {item}")
+    ck, rt = state.get("check") or {}, state.get("restore_test") or {}
+    if ck and not ck.get("ok"):
+        bad.append(f"integrity check failed: {ck.get('error')}")
+    if rt and not rt.get("ok"):
+        bad.append(f"restore test failed: {rt.get('error')}")
+    if r and rs and not rs.get("ok"):
+        soft.append(f"remote copy failing: {rs.get('error')}")
+    if not r:
+        soft.append("no off-server remote configured; backups exist on this machine only")
+    rts = parse_iso(rt.get("last_success"))
+    if rts is None:
+        soft.append("restore test has never passed (not tested)")
+    elif (t - rts).days > RESTORE_TEST_MAX_DAYS:
+        soft.append(f"restore test is old: last passed {ago(rts, t)}")
+    tm = d["schedule"]
+    if tm and tm.get("ActiveState") not in (None, "active"):
+        soft.append(f"systemd timer is {tm.get('ActiveState')}")
+    if started is None:
+        doc["health"], doc["summary"] = "unknown", "configured, but no backup has run yet"
+        doc["actions"].append("synk-backup run")
+        warns.extend(soft)
+        return doc
+    if last.get("result") == "in_progress":
+        if (t - started).total_seconds() > 12 * 3600:
+            bad.append("last run never finished (interrupted)")
+        else:
+            d["running"] = True
+    ref = finished or started
+    age_h = (t - ref).total_seconds() / 3600
+    succ = parse_iso(state.get("last_success"))
+    ok_bits = f"last full success {ago(succ, t)}" if succ else "no fully successful run yet"
+    rt_bit = f"restore test passed {ago(rts, t)}" if rts else "restore test not tested"
+    if age_h > STALE_HOURS:
+        doc["health"] = "stale"
+        doc["summary"] = f"no backup attempt for {age_h:.0f}h; {ok_bits}"
+        warns.append("the schedule does not seem to run (check: systemctl status softsynk-backup.timer)")
+    elif bad:
+        doc["health"], doc["summary"] = "unhealthy", f"{len(bad)} problem(s): " + bad[0]
+    elif soft:
+        doc["health"], doc["summary"] = "degraded", f"{ok_bits}; {soft[0]}"
+    else:
+        doc["health"], doc["summary"] = "healthy", f"{ok_bits}, {rt_bit}"
+    warns.extend(bad + soft)
+    if bad or soft:
+        doc["actions"].append("synk-backup run")
+    return doc
+
+
+HEALTH_EXIT = {"healthy": 0, "degraded": 1, "unhealthy": 2, "unknown": 3, "stale": 3}
+
+
+def cmd_status(ctx, as_json, json_exit_zero=True):
+    doc = build_status(ctx)
+    code = HEALTH_EXIT.get(doc["health"], 3) if doc["install_state"] == "installed" else 3
+    if as_json:
+        say(json.dumps(doc, indent=2, sort_keys=True))
+        return OK if json_exit_zero else code
+    say(f"backup: {doc['install_state']}, {doc['health']}: {doc['summary']}")
+    d = doc["details"]
+    if doc["install_state"] == "installed":
+        say(f"  local repo : {d['local']['location']}" + (
+            f" ({human(d['local']['free_bytes'])} free)" if d["local"]["free_bytes"] is not None else ""))
+        rm = d["remote"]
+        say("  remote     : " + ("none" if not rm else f"{rm['endpoint'] or 'custom'} / {rm['bucket']} "
+                                  f"(last copy {rm['last_copy'] or 'never'})"))
+        for name, v in d["databases"].items():
+            ls = ", ".join(f"{k}={(x or 'never')[:10]}" for k, x in v["last_success"].items())
+            say(f"  {name:20} {v['status']:10} {ls}")
+        if d.get("schedule"):
+            say(f"  timer      : {d['schedule'].get('ActiveState')} next {d['schedule'].get('NextElapseUSecRealtime')}")
+    for w in doc["warnings"]:
+        say(f"  ! {w}")
+    return code
+
+
+# ---------------------------------------------------------------- CLI
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: error: {message}\n")
+        sys.exit(USAGE)
+
+
+def build_parser():
+    common = Parser(add_help=False)
+    common.add_argument("--root", default=argparse.SUPPRESS, help="management root (default $SOFTSYNK_ROOT or /opt/softsynk-server-management)")
+    p = Parser(prog="synk-backup", parents=[common], description="PostgreSQL backups with restic: local repository plus S3-compatible remote.",
+               epilog="exit codes: 0 ok, 1 failed, 2 partial (some failed), 64 usage or config error, 75 busy (lock held), 130 cancelled. "
+                      "--status (with or without --json): 0 healthy, 1 degraded, 2 unhealthy, 3 unknown/stale/not installed; "
+                      "--status-json always exits 0.")
+    p.add_argument("--status", action="store_true", help="show backup health (read-only); exits by health")
+    p.add_argument("--json", action="store_true", help="with --status: machine-readable output, same exit codes")
+    p.add_argument("--status-json", action="store_true", help="status JSON for softsynk-server (module contract; always exits 0)")
+    p.add_argument("--version", action="store_true")
+    sub = p.add_subparsers(dest="cmd", parser_class=Parser, metavar="COMMAND")
+    s = sub.add_parser("run", parents=[common], help="back up now (what is due)")
+    s.add_argument("--db"), s.add_argument("--dry-run", action="store_true")
+    sub.add_parser("check", parents=[common], help="restic check (5%% data subset) on both repositories")
+    s = sub.add_parser("restore-test", parents=[common], help="restore the newest snapshot into a throwaway database and verify")
+    s.add_argument("--db"), s.add_argument("--from", dest="source", choices=("local", "remote"), default="local")
+    s = sub.add_parser("restore", parents=[common], help="restore a database (or globals) from a snapshot")
+    s.add_argument("--db"), s.add_argument("--globals", action="store_true")
+    s.add_argument("--from", dest="source", choices=("local", "remote"), default="local")
+    s.add_argument("--snapshot", default="latest"), s.add_argument("--to-db"), s.add_argument("--to-file")
+    s.add_argument("--replace-existing", action="store_true"), s.add_argument("--confirm-restore", default=None)
+    s = sub.add_parser("snapshots", parents=[common], help="list snapshots")
+    s.add_argument("--from", dest="source", choices=("local", "remote"), default="local"), s.add_argument("--json", action="store_true")
+    sub.add_parser("validate", parents=[common], help="re-check tools, PostgreSQL access and both repositories (read-only)")
+    s = sub.add_parser("configure", parents=[common], help="validate, then write config, secrets and create repositories")
+    s.add_argument("--local-repo"), s.add_argument("--remote-preset", choices=sorted(PRESETS) + ["custom", "none"])
+    for k in ("id", "endpoint", "region", "bucket", "prefix", "repo"):
+        s.add_argument(f"--remote-{k}")
+    s.add_argument("--mail-to")
+    for t in TIERS:
+        s.add_argument(f"--retention-{t.replace('_', '-')}", dest=f"retention_{t}", type=int)
+    s.add_argument("--compression"), s.add_argument("--exclude-databases", help="comma separated")
+    for k in ("runas", "bin-dir", "host", "port"):
+        s.add_argument(f"--pg-{k}")
+    s.add_argument("--secrets-stdin", action="store_true", help="read JSON secrets from stdin")
+    s.add_argument("--dry-run", action="store_true")
+    sub.add_parser("config", parents=[common], help="print the configuration (no secrets) as JSON")
+    sub.add_parser("genpass", parents=[common], help="print a new random repository password")
+    s = sub.add_parser("notify", parents=[common], help="mail a failure notice (used by the systemd OnFailure unit)")
+    s.add_argument("--unit", required=True)
+    return p
+
+
+COMMANDS = {"run": cmd_run, "check": cmd_check, "restore-test": cmd_restore_test, "restore": cmd_restore,
+            "snapshots": cmd_snapshots, "validate": cmd_validate, "configure": cmd_configure,
+            "config": cmd_config, "genpass": cmd_genpass, "notify": cmd_notify}
+
+
+def main(argv=None):
+    a = build_parser().parse_args(argv)
+    if a.version:
+        say(f"synk-backup {VERSION}")
+        return OK
+    ctx = Ctx(getattr(a, "root", None) or os.environ.get("SOFTSYNK_ROOT") or "/opt/softsynk-server-management")
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, _on_signal)
+    try:
+        if a.status_json:
+            return cmd_status(ctx, True)
+        if a.status:
+            return cmd_status(ctx, a.json, json_exit_zero=False)
+        if not a.cmd:
+            build_parser().print_help(sys.stderr)
+            return USAGE
+        return COMMANDS[a.cmd](ctx, a)
+    except Fail as e:
+        warn(f"synk-backup: {e}")
+        return e.code
+    except Interrupted as e:
+        warn(f"synk-backup: interrupted (signal {e.sig})")
+        return 128 + e.sig
+    except BrokenPipeError:
+        return OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

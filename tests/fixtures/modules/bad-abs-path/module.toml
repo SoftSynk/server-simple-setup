@@ -1,0 +1,13 @@
+schema = 1
+id = "bad-abs-path"
+name = "x"
+description = "x fixture"
+version = "1.0.0"
+interface = 1
+requires = []
+effects = ["writes a marker under its state directory"]
+
+[operations]
+install = ["/bin/sh", "-c", "true"]
+status = ["run.sh", "status", "healthy"]
+configure = ["run.sh", "configure"]

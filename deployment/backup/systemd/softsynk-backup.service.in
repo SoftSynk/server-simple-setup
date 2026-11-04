@@ -1,0 +1,13 @@
+[Unit]
+Description=softsynk PostgreSQL backup (synk-backup run)
+After=network-online.target postgresql.service
+Wants=network-online.target
+OnFailure=softsynk-notify@%n.service
+
+[Service]
+Type=oneshot
+ExecStart=@SYNK_BACKUP@ --root @ROOT@ run
+Nice=10
+IOWeight=10
+# Runs can be long on big databases; synk-backup bounds every child command itself.
+TimeoutStartSec=infinity
